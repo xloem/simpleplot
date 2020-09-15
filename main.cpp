@@ -70,7 +70,20 @@ public:
 		assert(single == 0);
 		single = this;
 
+		try {
+			std::vector<uint8_t> data = get(url);
+		} catch (...) {
+			spot
+			account
+		}
+
 	}
+
+	struct endpoint
+	{
+		uint64_t account;
+		uint64_t depth;
+	} spot;
 
 	std::vector<uint8_t> get(std::string url)
 	{
@@ -102,11 +115,23 @@ public:
 		return result;
 	}
 
-	struct endpoint
+	std::string filename()
 	{
-		uint64_t account;
-		uint64_t depth;
-	} spot;
+		return "/hellofilename";
+	}
+
+	uint64_t filesize()
+	{
+		return 5;
+	}
+
+	uint64_t filedata(uint8_t * buffer, uint64_t offset, uint64_t len)
+	{
+		std::string demodata = "hello";
+		if (len > demodata.size()) { len = demodata.size(); }
+		std::copy(demodata.begin(), demodata.end(), buffer);
+		return len;
+	}
 
 	sia::skynet_multiportal portal;
 };
@@ -118,18 +143,18 @@ Generator * Generator::single = 0;
 class PlotFS : public Fusepp::Fuse<PlotFS>
 {
 public:
-	static int getattr(const char *, struct stat *, struct fuse_file_info *)
+	static int getattr(const char *path, struct stat *stbuf, struct fuse_file_info *)
 	{
 		int res = 0;
-	
+
 		memset(stbuf, 0, sizeof(struct stat));
-		if (path == "/") {
+		if (path[0] == '/' && path[1] == 0) {
 			stbuf->st_mode = S_IFDIR | 0755;
 			stbuf->st_nlink = 2;
-		} else if (path == hello_path) {
+		} else if (path == Generator::single->filename()) {
 			stbuf->st_mode = S_IFREG | 0444;
 			stbuf->st_nlink = 1;
-			stbuf->st_size = hello_str.length();
+			stbuf->st_size = Generator::single->filesize();
 		} else
 			res = -ENOENT;
 	
@@ -137,18 +162,20 @@ public:
 	}
 	static int readdir(const char *path, void*buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags)
 	{
-		if (path != "/")
+		if (path[0] != '/' || path[1] != 0) {
 			return -ENOENT;
+		}
 	
 		filler(buf, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
 		filler(buf, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
-		filler(buf, hello_path.c_str() + 1, NULL, 0, FUSE_FILL_DIR_PLUS);
+		auto fn = Generator::single->filename();
+		filler(buf, fn.c_str() + 1, NULL, 0, FUSE_FILL_DIR_PLUS);
 	
 		return 0;
 	}
 	static int open(const char *path, struct fuse_file_info *fi)
 	{
-		if (path != hello_path)
+		if (path != Generator::single->filename())
 			return -ENOENT;
 	
 		if ((fi->flags & 3) != O_RDONLY)
@@ -158,24 +185,19 @@ public:
 	}
 	static int read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 	{
-		if (path != hello_path)
+		if (path != Generator::single->filename())
 			return -ENOENT;
 	
-		size_t len;
-		len = hello_str.length();
-		if ((size_t)offset < len) {
-			if (offset + size > len)
-				size = len - offset;
-			memcpy(buf, hello_str.c_str() + offset, size);
-		} else
-			size = 0;
-	
-		return size;
+		return Generator::single->filedata((uint8_t*)buf, offset, size);
 	}
-}
+};
 
 int main(int argc, char **argv)
 {
+	if (argc==1) {
+		return -1;
+	}
 	Generator generator(argv[0]);
-	plotfs.run(argc, argv+1);
+	PlotFS plotfs;
+	plotfs.run(argc-1, argv+1);
 }

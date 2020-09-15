@@ -1,0 +1,5 @@
+- Fusepp
+	which needs:
+	- fuse3-devel
+- siaskynetpp
+- libShabal

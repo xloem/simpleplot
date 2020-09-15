@@ -1,3 +1,9 @@
 [submodule "libShabal"]
 	path = libShabal
 	url = https://github.com/burst-apps-team/libShabal.git
+[submodule "siaskynetpp"]
+	path = siaskynetpp
+	url = https://github.com/xloem/siaskynetpp.git
+[submodule "Fusepp"]
+	path = Fusepp
+	url = https://github.com/jachappell/Fusepp.git

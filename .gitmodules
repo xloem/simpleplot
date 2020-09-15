@@ -1,0 +1,3 @@
+[submodule "libShabal"]
+	path = libShabal
+	url = https://github.com/burst-apps-team/libShabal.git

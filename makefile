@@ -3,8 +3,8 @@ LDFLAGS=-L/usr/local/lib64 -ggdb
 CXXFLAGS=-std=c++17 -ggdb
 LDLIBS=-lsiaskynetpp -lcpr -lcurl $$(pkg-config --libs fuse3) $$(pkg-config --libs openssl) -LlibShabal/target/release -lshabal -Wl,-rpath,libShabal/target/release
 
-runtest: skystreamtest
-	echo 'hello world' | ./skystreamtest
+runtest: skystreamtest bufferedskystreamtest
+	echo 'hello world' | ./bufferedskystreamtest
 
 run: simpleplot
 	./simpleplot 0.json -d test

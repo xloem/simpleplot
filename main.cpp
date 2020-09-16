@@ -44,32 +44,6 @@ void create_plot(uint64_t account_id,
 
 }
 
-/// Creates PoC Nonces, with SIMD instructions for extra speed.
-///
-/// `plot_buffer` must be correct size - no size checks are performed.
-///
-/// `nonce_count` counts from 1 - 0 is no plots and will do nothing.
-void create_plots(uint64_t account_id,
-                  uint64_t start_nonce,
-                  uint64_t nonce_count,
-                  uint8_t poc_version,
-                  uint8_t *plot_buffer,
-                  uintptr_t plot_buffer_offset);
-
-#include <string>
-
-void write_plotfile(uint64_t acct, uint64_t start, uint64_t count, std::string * filename = 0)
-{
-	uint64_t size = count * sizeof(nonce);
-}
-
-uint64_t write_plotfile_bybytes(uint64_t acct, uint64_t start, uint64_t size, std::string * filename = 0)
-{
-	uint64_t count = size / sizeof(nonce);
-	write_plotfile(acct, start, count, filename);
-	return start + count;
-}
-
 #include <siaskynet_multiportal.hpp>
 #include <cassert>
 
@@ -83,91 +57,336 @@ public:
 	BufferedSkystream(nlohmann::json identifiers, sia::skynet_multiportal & multiportal)
 	:skystream(identifiers, multiportal) {start();}
 
+	BufferedSkystream(BufferedSkystream const &) = default;
+	BufferedSkystream(BufferedSkystream &&) = default;
+
 	~BufferedSkystream()
 	{
-		std::lock_guard<std::mutex> lock(queue_mutex);
-		pumping = false;
-		thread.join();
+		shutdown();
+	}
+
+	void shutdown()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (!pumping) {
+				return;
+			}
+			pumping = false;
+		}
+		threadup.join();
+		threaddown.join();
 	}
 
 	uint64_t size()
 	{
-		return offset;
+		std::lock_guard<std::mutex> lock(mutex);
+		return offsetup;
 	}
 	uint64_t backlog()
 	{
-		std::lock_guard<std::mutex> lock(queue_mutex);
-		return queue.size();
+		std::lock_guard<std::mutex> lock(mutex);
+		return queueup.size();
 	}
 	uint64_t uploadedsize()
 	{
-		return size() - backlog();
+		std::lock_guard<std::mutex> lock(mutex);
+		return offsetup - queueup.size();
+	}
+	void basictipmetadata(nlohmann::json & identifiers, uint64_t & uploaded, uint64_t & total)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		identifiers = skystream::identifiers();
+		total = offsetup;
+		uploaded = total - queueup.size();
 	}
 
 	void append(std::vector<uint8_t> && data)
 	{
-		std::lock_guard<std::mutex> lock(queue_mutex);
-		queue.insert(data.begin(), data.end(), queue.end());
-		moredata.notify_all();
+		std::lock_guard<std::mutex> lock(mutex);
+		queueup.insert(queueup.end(), data.begin(), data.end());
+		moredataup.notify_all();
 	}
 
+	std::vector<uint8_t> read(double offset)
+	{
+		std::unique_lock<std::mutex> lock(mutex);
+		reading.notify_all();
+		offsetdown = offset;
+		queuedown.clear();
+		moredatadown.wait(lock, [&]() {
+			return !pumping || queuedown.size() != 0;
+		});
+		std::vector<uint8_t> data = std::move(queuedown);
+		return data;
+	}
+	void doneread()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		offsetdown = -1;
+		queuedown.clear();
+	}
+
+	std::mutex mutex;
+	std::condition_variable uploaded; // notified when the size increases
+
 private:
+	std::condition_variable reading;
 	void start()
 	{
-		std::lock_guard<std::mutex> lock(queue_mutex);
-		offset = span("bytes").second;
-		thread = std::thread(&pump, *this);
-		thread.detach();
+		std::lock_guard<std::mutex> lock(mutex);
+		offsetup = span("bytes").second;
+		offsetdown = -1;
+		threadup = std::thread(&BufferedSkystream::pumpup, this);
+		threadup.detach();
+		threaddown = std::thread(&BufferedSkystream::pumpdown, this);
+		threaddown.detach();
 	}
-	void pump()
+	void pumpup()
 	{
 		while ("pumploop") {
 			std::vector<uint8_t> data;
 
 			{
-				std::lock_guard<std::mutex> lock(queue_mutex);
-				moredata.wait_for(queuemutex, 0, [&] {
-					return pumping && queue.size() == 0;
+				std::unique_lock<std::mutex> lock(mutex);
+				moredataup.wait(lock, [&]() {
+					return !pumping || queueup.size() != 0;
 				});
-				data = std::move(queue);
+				if (!pumping && queueup.size() == 0) {
+					uploaded.notify_all();
+					return;
+				}
+				data = std::move(queueup);
 			}
 			if (data.size()) {
-				write(data, "bytes", offset);
-				offset += data.size();
-			}
-			if (!pumping) {
-				return;
+				write(data, "bytes", offsetup);
+				offsetup += data.size();
+				{
+					std::lock_guard<std::mutex> lock(mutex);
+					uploaded.notify_all();
+				}
 			}
 		}
 	}
 
+	void pumpdown()
+	{
+		ssize_t offset = -1;
+		while ("pumploop") {
+			std::vector<uint8_t> data;
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				if (offset == -1) {
+					reading.wait(lock);
+				}
+				offset = offsetdown;
+				if  (!pumping) {
+					moredatadown.notify_all();
+					return;
+				}
+			}
+			if (offset != -1) {
+				auto data = skystream::read("bytes", offset);
+				if (data.size()) {
+					std::lock_guard<std::mutex> lock(mutex);
+					offset += data.size();
+					queuedown.insert(queuedown.end(), data.begin(), data.end());
+					offsetdown = offset;
+					moredatadown.notify_all();
+				} else {
+					std::lock_guard<std::mutex> lock(mutex);
+					offsetdown = offset = -1;
+				}
+			} 
+		}
+	}
+
 	bool pumping = true;
-	std::thread thread;
-	std::mutex queuemutex;
-	std::condition_variable moredata;
-	std::vector<uint8_t> queue;
-	size_t offset;
+	std::thread threadup;
+	std::thread threaddown;
+	std::condition_variable moredataup;
+	std::condition_variable moredatadown;
+	std::vector<uint8_t> queueup;
+	std::vector<uint8_t> queuedown;
+	size_t offsetup;
+	size_t offsetdown;
 };
 
 class Plotfile
 {
 public:
-	Plotfile(account, nlohmann::json metadata = {})
-	: account(account), metadata(metadata), metastream(multiportal)
+	Plotfile(uint64_t account)
+	: account(account), metastream(multiportal)
 	{
-		if (!metadata.contains("depth")) {
-			metadata["depth"] = 0;
+		std::cerr << "Readying scoop pumps ..." << std::endl;
+		while (scoops.size() < sizeof(nonce::scoops) / sizeof(nonce::scoop)) {
+			metadata["scoopstreams"][scoops.size()] = nullptr;
+			scoops.emplace_back(new BufferedSkystream(multiportal));
+			std::cerr << scoops.size() << "/" << sizeof(nonce::scoops) / sizeof(nonce::scoop) << "\r" << std::flush;
 		}
-		plot();
+		start();
+	}
+	Plotfile(uint64_t account, nlohmann::json identifiers)
+	: account(account), metastream(identifiers, multiportal), _identifiers(identifiers)
+	{
+		auto data = metastream.read("index", metastream.span("index").second);
+		std::string str(data.begin(), data.end());
+		metadata = nlohmann::json::parse(str);
+		std::cerr << "Found metadata document. " << std::endl;
+		std::cerr << "Readying scoop pumps ..." << std::endl;
+		for (auto & identifiers :metadata["scoopstreams"]) {
+			scoops.emplace_back(new BufferedSkystream(multiportal));
+			std::cerr << scoops.size() << "/" << sizeof(nonce::scoops) / sizeof(nonce::scoop) << "\r" << std::flush;
+		}
+		start();
 	}
 
-private:
-	void plot()
+	int64_t filename_to_noncecount(std::string name)
 	{
+		auto pos1 = name.find_first_of('_');
+		auto pos2 = name.find_first_of('_', pos1);
+		if (pos2 == std::string::npos || pos1 == std::string::npos) {
+			return -1;
+		}
+		try {
+			uint64_t account = std::stoull(name.substr(0, pos1));
+			uint64_t startingnonce = std::stoull(name.substr(pos1+1, pos2-pos1 - 1));
+			uint64_t noncecount = std::stoull(name.substr(pos2+1,name.size()-pos2-1));
+			if (startingnonce != 0 || account != this->account) {
+				return -1;
+			}
+			if (noncecount > this->noncecount()) {
+				return -1;
+			}
+			return noncecount;
+		} catch(...) {
+			return -1;
+		}
+	}
+
+	std::string filename()
+	{
+		return std::to_string(account) + "_0_" + std::to_string(noncecount());
+	}
+
+	nlohmann::json identifiers()
+	{
+		std::lock_guard<std::mutex> guard(mutex);
+		return _identifiers;
+	}
+
+	uint64_t noncecount()
+	{
+		std::lock_guard<std::mutex> guard(mutex);
+		return depth;
+	}
+
+	size_t readscoops(uint8_t * buf, uint64_t noncecount, size_t offset, size_t size)
+	{
+		constexpr uint64_t scoopcount = sizeof(nonce::scoops) / sizeof(nonce::scoop);
+		// noncecount shows total filesize
+		// scoop id is within offset
+		uint64_t scoopssize = noncecount * sizeof(nonce) / scoopcount;
+		uint64_t scoopsindex = offset / scoopssize;
+		offset -= scoopsindex * scoopssize;
+		if (scoopsindex != lastscoopread) {
+			scoops[lastscoopread]->doneread();
+			lastscoopread = scoopsindex;
+		}
+		auto data = scoops[scoopsindex]->read(offset);
+		if (data.size() > size) {
+			data.resize(size);
+		}
+		std::copy(data.begin(), data.end(), buf);
+		return data.size();
+	}
+
+	void shutdown()
+	{
+		if (stoppedcount() == 0) {
+			incrementstoppedcount();
+			scoopsthread.join();
+			metadatathread.join();
+		}
+	}
+
+	uint64_t const account;
+
+private:
+	void start()
+	{
+		scoopsthread = std::thread(&Plotfile::sendplot, this);
+		metadatathread = std::thread(&Plotfile::scribeplot, this);
+		lastscoopread = 0;
+	}
+	void sendplot()
+	{
+		std::cerr << "Beginning plot generation thread ..." << std::endl;
+		uint64_t depthup;
+		{
+			std::lock_guard<std::mutex> guard(mutex);
+			depthup = this->depth;
+		}
 		nonce plotbit;
-		create_plot(account, metadata["depth"], 2, &plotbit, 0);
-		
-		// generate 1 nonce, and append all scoops to stream
+		while (stoppedcount() == 0) {
+			// generate 1 nonce, and append all scoops to stream
+			create_plot(account, depthup, 2, (uint8_t*)&plotbit, 0);
+			
+			// convert to scoops
+			for (size_t index = 0; index < sizeof(plotbit.scoops) / sizeof(nonce::scoop); ++ index) {
+				auto & scoop = plotbit.scoops[index];
+				std::vector<uint8_t> data;
+				data.resize(sizeof(nonce::scoop));
+				std::copy((char*)&scoop,(char*)(&scoop+1),data.data());
+				assert(scoops[index]->size() == depthup * data.size());
+				// scoops bounds should all have the right index
+				scoops[index]->append(std::move(data));
+			}
+			++ depthup;
+		}
+		// wait for all scoops to send
+		for (auto & scoop : scoops) {
+			scoop->shutdown();
+		}
+		incrementstoppedcount();
+	}
+	void scribeplot()
+	{
+		std::cerr << "Beginning plot consolidation thread ..." << std::endl;
+		int64_t lastminimum = depth;
+		while (stoppedcount() < 2) {
+			int64_t minimum = -1;
+			size_t minimumindex;
+			for (size_t index = 0; index < scoops.size(); ++ index) {
+				nlohmann::json identifiers;
+				uint64_t uploaded, total;
+				scoops[index]->basictipmetadata(identifiers, uploaded, total);
+				metadata["scoopstreams"][index] = identifiers;
+				if (uploaded < minimum || minimum == -1) {
+					minimum = uploaded;
+					minimumindex = index;
+				}
+			}
+			if (minimum > lastminimum) {
+				std::cerr << "Stored new noncecount of " << minimum << "." << std::endl;
+				lastminimum = minimum;
+				std::vector<uint8_t> data;
+				{
+					std::lock_guard<std::mutex> guard(mutex);
+					depth = minimum;
+					std::string datastr = metadata.dump();
+					data.insert(data.end(), datastr.begin(), datastr.end());
+				}
+				metastream.write(data, "bytes", metastream.span("bytes").second);
+				{
+					std::lock_guard<std::mutex> guard(mutex);
+					_identifiers = metastream.identifiers();
+				}
+			} else {
+				std::unique_lock<std::mutex> lock(scoops[minimumindex]->mutex);
+				scoops[minimumindex]->uploaded.wait(lock);
+			}
+		}
 	}
 	// skystream:
 	// .get(json identifiers) // returns a std::vector<uint8_t> for identifires["skylink"]
@@ -176,173 +395,109 @@ private:
 	// .span(string span) // return a pair of bounds for span
 	// .write(vector data, string span, double offset) // write to stream, offset should be end of span
 	// .read(string span, double offset, string flow = "real") // read from stream, returns vector
-	// spans are "bytes", "time", "index", or others made up
+	// spans are "bytes", "time", "index"
 	// so we could write to nonces or scoops
-	uint64_t account;
 	sia::skynet_multiportal multiportal;
 	skystream metastream;
-	std::vector<BufferedSkystream> scoops;
 	nlohmann::json metadata;
+	std::vector<std::unique_ptr<BufferedSkystream>> scoops;
+
+	std::thread metadatathread;
+	std::thread scoopsthread;
+	ssize_t lastscoopread;
+
+	std::mutex mutex;
+	int _stoppedcount;
+	uint64_t depth;
+	nlohmann::json _identifiers;
+	int stoppedcount()
+	{
+		std::lock_guard<std::mutex> guard(mutex);
+		return _stoppedcount;
+	}
+	void incrementstoppedcount()
+	{
+		std::lock_guard<std::mutex> guard(mutex);
+		++ _stoppedcount;
+	}
+	
 };
 
-class Generator
-{
-public:
-	static Generator * single;
-
-	// data is made of streams of scoops
-	// streams of scoops are made from streams of nonces
-	// each nonce has another set of scoops in it.
-
-	Generator(std::string url, uint64_t blocksize=1024*1024*1)
-	: blocksize(blocksize), url("sia://" + url)
-	{
-		assert(single == 0);
-		single = this;
-
-		std::cout << url << std::endl;
-
-		try {
-			spot = queryspot(url);
-		} catch (std::runtime_error const & fetcherror) {
-			spot.depth = 0;
-			try {
-				spot.account = std::stoull(url);
-			} catch(std::invalid_argument & converterror) {
-				throw fetcherror;
-			}
-			for(int i = 0; i < sizeof(spot.parallel_link); ++i){
-				spot.parallel_link[i] = ' ';
-			}
-			newplot();
-		}
-
-	}
-
-	uint64_t blocksize;
-
-	std::string filenameforspot(endpoint spot, size_t size)
-	{
-		return std::to_string(spot.account) + "_" + std::to_string(spot.depth) + "_" + std::to_string(spot.count);
-	}
-
-	void newplot()
-	{
-		std::cout << "Plotting ..." << std::endl;
-		std::vector<uint8_t> newplot;
-		endpoint newspot = spot;
-		newspot.count = blocksize;
-		newplot.resize(blocksize + sizeof(newspot));
-		uint64_t count = blocksize / sizeof(nonce);
-		create_plots(spot.account, newspot.depth, newspot.count, 2, newplot.data(), 0);
-		std::cout << "Uploading " << newplot.size() << " bytes ..." << std::endl;
-		std::copy((char*)&newspot, (char*)(&newspot+1), newplot.data() + blocksize);
-		newspot.depth += newspot.count;
-		std::string link = put(std::move(newplot));
-		std::copy(link.data() + link.size() - sizeof(spot.parallel_link), link.data() + link.size(), spot.parallel_link);
-		std::cout << std::string(spot.parallel_link, spot.parallel_link+sizeof(spot.parallel_link)) << std::endl;
-
-		spot = newspot;
-			// moves wrong way
-			// as we get more
-	}
-
-	struct endpoint
-	{
-		uint64_t account;
-		uint64_t depth;
-		uint64_t count;
-		char parallel_link[46];
-	} spot;
-	std::string url;
-
-	endpoint queryspot(std::string url)
-	{
-		auto xfer = portal.begin_transfer(sia::skynet_multiportal::transfer_kind::download);
-		sia::skynet skynet(xfer.portal);
-		auto query = skynet.query(url, std::chrono::milliseconds(1000));
-		std::vector<uint8_t> data = skynet.download(url, {{query.metadata.len - sizeof(endpoint), query.metadata.len}}, std::chrono::milliseconds(10000)).data;
-		endpoint spot;
-		std::copy(data.begin(), data.end(), (char*)&spot);
-		
-		portal.end_transfer(xfer, sizeof(spot) + sizeof(query));
-		return spot;
-	}
-
-	std::vector<uint8_t> get(std::string url)
-	{
-		auto xfer = portal.begin_transfer(sia::skynet_multiportal::transfer_kind::download);
-		std::vector<uint8_t> result;
-		try {
-			sia::skynet portal(xfer.portal);
-			result = portal.download(url, {}, std::chrono::milliseconds(1000)).data;
-		} catch(...) {
-			portal.end_transfer(xfer, 0);
-			throw;
-		}
-		portal.end_transfer(xfer, result.size());
-		return result;
-	}
-
-	std::string put(std::vector<uint8_t> const & data)
-	{
-		auto xfer = portal.begin_transfer(sia::skynet_multiportal::transfer_kind::upload);
-		std::string result;
-		try {
-			sia::skynet portal(xfer.portal);
-			result = portal.upload({"",data,""}, std::chrono::milliseconds(120000));
-		} catch(...) {
-			portal.end_transfer(xfer, 0);
-			throw;
-		}
-		portal.end_transfer(xfer, data.size());
-		return result;
-	}
-
-	std::string filename()
-	{
-		return "/hellofilename";
-	}
-
-	uint64_t filesize()
-	{
-		return 5;
-	}
-
-	uint64_t filedata(uint8_t * buffer, uint64_t offset, uint64_t len)
-	{
-		std::string demodata = "hello";
-		if (len > demodata.size()) { len = demodata.size(); }
-		std::copy(demodata.begin(), demodata.end(), buffer);
-		return len;
-	}
-
-	sia::skynet_multiportal portal;
-};
-Generator * Generator::single = 0;
-
+#define FUSE_USE_VERSION 34
 #include "Fusepp/Fuse.cpp"
 
 
+#include <fstream>
+#include <sstream>
+#include <cstdio> // for rename
+#include <cstring>  // for strerror, handling rename's return
 class PlotFS : public Fusepp::Fuse<PlotFS>
 {
 public:
+	PlotFS(std::string configfilename)
+	{
+		PlotFS::configfilename = configfilename;
+		uint64_t account = std::stoull(configfilename);
+		std::cerr << "Opening config file " << configfilename << " ..." << std::endl;
+		std::ifstream configfile(configfilename);
+		if (configfile.is_open()) {
+			std::ostringstream configstrm;
+			configstrm << configfile.rdbuf();
+			std::string configstr = configstrm.str();
+
+			std::cerr << "Resuming plotting for account id " << account << " ..." << std::endl;
+			plotfile = new Plotfile(account,nlohmann::json::parse(configstr));
+			lastnoncecount = plotfile->noncecount();
+		} else {
+			std::cerr << " ... failed.  Will write file after starting to plot." << std::endl;
+			std::cerr << "Initiating plotting for account id " << account << " ..." << std::endl;
+			plotfile = new Plotfile(account);
+			updateconfig();
+		}
+	}
+	~PlotFS()
+	{
+		plotfile->shutdown();
+		updateconfig();
+		delete plotfile;
+	}
+	static void updateconfig()
+	{
+		auto noncecount = plotfile->noncecount();
+		if (noncecount == lastnoncecount) {
+			return;
+		}
+		std::cerr << "Writing " << configfilename << " with " << noncecount << " nonces ..." << std::endl;
+		lastnoncecount = noncecount;
+		std::istringstream configstrm(plotfile->identifiers().dump());
+		std::string tempfile = configfilename + "_update";
+		std::ofstream configfile(tempfile);
+		configfile << configstrm.rdbuf();
+		configfile.close();
+		int result = std::rename(tempfile.c_str(), configfilename.c_str());
+		if (result != 0) {
+			throw std::runtime_error(strerror(result));
+		}
+	}
 	static int getattr(const char *path, struct stat *stbuf, struct fuse_file_info *)
 	{
-		int res = 0;
-
 		memset(stbuf, 0, sizeof(struct stat));
 		if (path[0] == '/' && path[1] == 0) {
 			stbuf->st_mode = S_IFDIR | 0755;
 			stbuf->st_nlink = 2;
-		} else if (path == Generator::single->filename()) {
-			stbuf->st_mode = S_IFREG | 0444;
-			stbuf->st_nlink = 1;
-			stbuf->st_size = Generator::single->filesize();
-		} else
-			res = -ENOENT;
-	
-		return res;
+			return 0;
+		}
+		if (path[0] != '/') {
+			return -ENOENT;
+		}
+		auto noncecount = plotfile->filename_to_noncecount(path + 1);
+		if (noncecount == -1) {
+			return -ENOENT;
+		}
+		stbuf->st_mode = S_IFREG | 0444;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = noncecount * sizeof(nonce);
+		return 0;
 	}
 	static int readdir(const char *path, void*buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi, enum fuse_readdir_flags)
 	{
@@ -352,36 +507,50 @@ public:
 	
 		filler(buf, ".", NULL, 0, FUSE_FILL_DIR_PLUS);
 		filler(buf, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
-		auto fn = Generator::single->filename();
-		filler(buf, fn.c_str() + 1, NULL, 0, FUSE_FILL_DIR_PLUS);
+		std::string filename = plotfile->filename();
+		filler(buf, filename.c_str(), NULL, 0, FUSE_FILL_DIR_PLUS);
+		updateconfig();
 	
 		return 0;
 	}
 	static int open(const char *path, struct fuse_file_info *fi)
 	{
-		if (path != Generator::single->filename())
-			return -ENOENT;
-	
-		if ((fi->flags & 3) != O_RDONLY)
+		if ((fi->flags & 3) != O_RDONLY) {
 			return -EACCES;
+		}
+
+		auto noncecount = plotfile->filename_to_noncecount(path + 1);
+		if (noncecount == -1) {
+			return -ENOENT;
+		}
+		updateconfig();
 	
 		return 0;
 	}
 	static int read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)
 	{
-		if (path != Generator::single->filename())
+		auto noncecount = plotfile->filename_to_noncecount(path + 1);
+		if (noncecount == -1) {
 			return -ENOENT;
+		}
 	
-		return Generator::single->filedata((uint8_t*)buf, offset, size);
+		return plotfile->readscoops((uint8_t*)buf, noncecount, offset, size);
 	}
+	// PlotFS is hacky because Fusepp is incomplete
+	static Plotfile * plotfile;
+	static uint64_t lastnoncecount;
+	static std::string configfilename;
 };
+Plotfile * PlotFS::plotfile;
+uint64_t PlotFS::lastnoncecount;
+std::string PlotFS::configfilename;
 
 int main(int argc, char **argv)
 {
-	if (argc==1) {
+	if (argc<2) {
+		std::cout << "Provide <accountnum>.json as first argument." << std::endl;
 		return -1;
 	}
-	Generator generator(argv[1]);
-	PlotFS plotfs;
+	PlotFS plotfs(argv[1]);
 	plotfs.run(argc-1, argv+1);
 }

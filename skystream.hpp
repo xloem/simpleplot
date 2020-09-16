@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <thread>
+#include <unordered_map>
 
 // iostreams for debug
 #include <iostream>
@@ -51,23 +52,31 @@ public:
 	: tail{identifiers, get_json(identifiers)}, multiportal(multiportal)
 	{ }
 
+	skystream(skystream const &) = default;
+	skystream(skystream &&) = default;
+
 	std::vector<uint8_t> read(std::string span, double offset, std::string flow = "real")
 	{
 		auto metadata = this->get_node(tail, span, offset).metadata;
+		std::lock_guard<std::mutex> lock(methodmtx);
 		auto metadata_content = metadata["content"];
 		double content_start = metadata_content["spans"][span]["start"];
 		if (span != "bytes" && offset != content_start) {
 			throw std::runtime_error(span + " " + std::to_string(offset) + " is within block span");
 		}
 		auto data = get(metadata_content["identifiers"]);
-
+	
 		auto begin = data.begin() + offset - content_start;
 		auto end = data.begin() + metadata_content["bounds"]["bytes"]["end"] - content_start;
 		return {begin, end};
 	}
 
+	std::mutex writemtx;
 	void write(std::vector<uint8_t> & data, std::string span, double offset)
 	{
+		std::lock_guard<std::mutex> writelock(writemtx);
+
+		std::unique_lock<std::mutex> lock(methodmtx);
 		seconds_t end_time = time();
 		seconds_t start_time = tail.metadata["content"]["spans"]["time"]["end"];
 		
@@ -267,6 +276,8 @@ public:
 
 		auto metadata_identifiers = cryptography.digests({&metadata_upload.data});
 
+		lock.unlock();
+
 		std::mutex skylink_mutex;
 		std::string skylink;
 		auto ensure_upload = [&]() {
@@ -291,6 +302,7 @@ public:
 		auto upload2 = std::thread(ensure_upload);
 		upload1.join();
 		upload2.join();
+		lock.lock();
 		metadata_identifiers["skylink"] = skylink + "/" + metadata_upload.filename;
 
 		// if we want to supporto threading we'll likely need a lock around this whole function (not just the change to tail)
@@ -300,6 +312,7 @@ public:
 
 	std::map<std::string,std::pair<double,double>> block_spans(std::string span, double offset)
 	{
+		std::lock_guard<std::mutex> lock(methodmtx);
 		auto metadata = this->get_node(tail, span, offset).metadata;
 		std::map<std::string,std::pair<double,double>> result;
 		for (auto & content_span : metadata["content"]["bounds"].items()) {
@@ -317,6 +330,7 @@ public:
 
 	std::map<std::string,std::pair<double,double>> spans()
 	{
+		std::lock_guard<std::mutex> lock(methodmtx);
 		std::map<std::string,std::pair<double,double>> result;
 		for (auto & content_span : tail.metadata["content"]["spans"].items()) {
 			auto span = content_span.key();
@@ -356,6 +370,7 @@ public:
 
 	nlohmann::json identifiers()
 	{
+		std::lock_guard<std::mutex> lock(methodmtx);
 		return tail.identifiers;
 	}
 
@@ -386,6 +401,9 @@ public:
 		}
 		return result;
 	}
+
+protected:
+	std::mutex methodmtx;
 
 private:
 	struct node

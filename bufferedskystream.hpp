@@ -1,3 +1,4 @@
+#include <functional>
 #include <thread>
 #include <map>
 #include <unordered_set>
@@ -22,24 +23,49 @@ class bufferedskystreams
 {
 friend class bufferedskystream;
 public:
-	bufferedskystreams(sia::portalpool & portalpool, size_t maxblocksize = 1024*1024*128)
+	bufferedskystreams(sia::portalpool & portalpool, size_t maxblocksize = 1024*1024*128, std::function<void(bufferedskystream&,uint64_t)> down_callback = {}, std::function<void(bufferedskystream&,uint64_t)> up_callback = {})
 	: portalpool(portalpool),
 	  maxblocksize(maxblocksize)
-	{}
+	{
+		pumping = true;
+		down_thread = std::thread(&bufferedskystreams::pump_down, this);
+		up_thread = std::thread(&bufferedskystreams::pump_up, this);
+	}
+	~bufferedskystreams()
+	{
+		shutdown();
+	}
+	void shutdown();
 
 	void add(nlohmann::json identifiers = {});
 
+	void set_down_callback(std::function<void(bufferedskystream&,uint64_t)> callback)
+	{
+		std::scoped_lock lock(streams_mutex);
+		down_callback = callback;
+	}
+
+	void set_up_callback(std::function<void(bufferedskystream&,uint64_t)> callback)
+	{
+		std::scoped_lock lock(streams_mutex);
+		up_callback = callback;
+	}
+
 	size_t size()
 	{
+		std::scoped_lock lock(streams_mutex);
 		return streams.size();
 	}
 
 	bufferedskystream & get(size_t index)
 	{
+		std::scoped_lock lock(streams_mutex);
 		return *streams[index];
 	}
 
 //private:
+	bool pumping;
+	std::mutex streams_mutex;
 	std::vector<std::unique_ptr<bufferedskystream>> streams;
 	sia::portalpool & portalpool;
 	size_t maxblocksize;
@@ -49,6 +75,12 @@ public:
 	uint64_t biggest_write_queue_size;
 	std::mutex read_mutex;
 	std::mutex write_mutex;
+	std::thread down_thread;
+	std::thread up_thread;
+	std::function<void(bufferedskystream&,uint64_t)> up_callback, down_callback;
+
+	void pump_down();
+	void pump_up();
 };
 
 class bufferedskystream : public skystream
@@ -57,17 +89,13 @@ public:
 	using skystream::skystream;
 	bufferedskystream(bufferedskystreams & group)
 	: skystream(group.portalpool),
-	  reading(group.reading),
-	  writing(group.writing),
-	  maxblocksize(group.maxblocksize)
+	  group(group)
 	{
 		start();
 	}
 	bufferedskystream(nlohmann::json identifiers, bufferedskystreams & group)
 	: skystream(identifiers, group.portalpool),
-	  reading(group.reading),
-	  writing(group.writing),
-	  maxblocksize(group.maxblocksize)
+	  group(group)
 	{
 		start();
 	}
@@ -92,8 +120,8 @@ public:
 			}
 			pumping = false;
 		}
-		reading.notify_all();
-		writing.notify_all();
+		group.reading.notify_all();
+		group.writing.notify_all();
 	}
 
 	uint64_t sizeup()
@@ -131,17 +159,17 @@ public:
 			size_t toupload = data.size() - uploaded;
 			{
 				std::unique_lock<std::mutex> lock(mutex);
-				if (maxblocksize > 0) {
-					while (pumping && queueup.size() >= maxblocksize*2) {
+				if (group.maxblocksize > 0) {
+					while (pumping && queueup.size() >= group.maxblocksize*2) {
 						this->uploaded.wait(lock);
 					}
-					if (queueup.size() + toupload > maxblocksize*2) {
-						toupload = maxblocksize*2 - queueup.size() ;
+					if (queueup.size() + toupload > group.maxblocksize*2) {
+						toupload = group.maxblocksize*2 - queueup.size() ;
 					}
 				}
 				queueup.insert(queueup.end(), data.begin() + uploaded, data.begin() + uploaded + toupload);
 			}
-			writing.notify_all();
+			group.writing.notify_all();
 			uploaded += toupload;
 		}
 	}
@@ -240,7 +268,7 @@ public:
 			//std::cerr << "range of block around " << offset << " is [" << range.first << "," << range.second << ")" << std::endl;
 			offsetdown = range.first;
 		}
-		reading.notify_all();
+		group.reading.notify_all();
 		{
 			std::unique_lock<std::mutex> lock(mutex);
 			// we now need to wait until the queue contains our block.
@@ -279,11 +307,11 @@ public:
 				return 0;
 			}
 			// pull data to transfer into local variable
-			if (maxblocksize <= 0 || queueup.size() <= maxblocksize) {
+			if (group.maxblocksize <= 0 || queueup.size() <= group.maxblocksize) {
 				data = std::move(queueup);
 			} else {
-				data.insert(data.begin(), queueup.begin(), queueup.begin() + maxblocksize);
-				queueup.erase(queueup.begin(), queueup.begin() + maxblocksize);
+				data.insert(data.begin(), queueup.begin(), queueup.begin() + group.maxblocksize);
+				queueup.erase(queueup.begin(), queueup.begin() + group.maxblocksize);
 			}
 			offset = offsetup;
 		}
@@ -297,9 +325,6 @@ public:
 		}
 		return data.size();
 	}
-
-	std::condition_variable & reading; // notified after any read is requested
-	std::condition_variable & writing; // notified after any write is requested
 
 	std::mutex mutex;
 	std::condition_variable uploaded; // notified when write queue is emptied
@@ -351,19 +376,120 @@ private:
 		offsetdown = 0;
 		taildown = 0;
 	}
+	bufferedskystreams & group;
 	bool pumping = true;
-	size_t maxblocksize;
 	std::map<size_t, std::unique_ptr<downloader>> queuedown;
 	std::vector<uint8_t> queueup;
 	size_t offsetdown, taildown;
 	size_t offsetup;
 };
 
+
+void bufferedskystreams::shutdown()
+{
+	{
+		std::scoped_lock lock(streams_mutex);
+		pumping = false;
+		for (auto & stream : streams) {
+			stream->shutdown();
+		}
+	}
+	reading.notify_all();
+	writing.notify_all();
+	if (down_thread.joinable()) {
+		down_thread.join();
+	}
+	if (up_thread.joinable()) {
+		up_thread.join();
+	}
+}
+
 void bufferedskystreams::add(nlohmann::json identifiers)
 {
+	std::scoped_lock lock(streams_mutex);
 	if (identifiers.empty()) {
 		streams.emplace_back(new bufferedskystream(*this));
 	} else {
 		streams.emplace_back(new bufferedskystream(identifiers, *this));
+	}
+}
+void bufferedskystreams::pump_down()
+{
+	size_t index = 0;
+	bool anylive = true;
+	bool anyqueued = true;
+	
+	while("pumping") {
+		bufferedskystream * stream;
+		{
+			std::unique_lock lock(streams_mutex);
+			if (index >= streams.size()) {
+				lock.unlock();
+				if (!anylive && !pumping) {
+					return;
+				}
+				if (!anyqueued) {
+					std::unique_lock lock(read_mutex);
+					reading.wait(lock);
+				}
+				index = 0;
+				anylive = false;
+				anyqueued = false;
+				continue;
+			}
+			stream = streams[index].get();
+		}
+		ssize_t size = stream->queue_net_down();
+		if (size != -1) {
+			anylive = true;
+		}
+		if (size > 0) {
+			std::unique_lock lock(streams_mutex);
+			anyqueued = true;
+			if (down_callback) {
+				down_callback(*stream, size);
+			}
+		}
+		++ index;
+	}
+}
+void bufferedskystreams::pump_up()
+{
+	size_t index = 0;
+	bool anylive = true;
+	bool anyqueued = true;
+	
+	while("pumping") {
+		bufferedskystream * stream;
+		{
+			std::unique_lock lock(streams_mutex);
+			if (index >= streams.size()) {
+				lock.unlock();
+				if (!anylive && !pumping) {
+					return;
+				}
+				if (!anyqueued) {
+					std::unique_lock lock(write_mutex);
+					writing.wait(lock);
+				}
+				index = 0;
+				anylive = false;
+				anyqueued = false;
+				continue;
+			}
+			stream = streams[index].get();
+		}
+		ssize_t size = stream->xfer_net_up();
+		if (size != -1) {
+			anylive = true;
+		}
+		if (size > 0) {
+			std::unique_lock lock(streams_mutex);
+			anyqueued = true;
+			if (up_callback) {
+				up_callback(*stream, size);
+			}
+		}
+		++ index;
 	}
 }

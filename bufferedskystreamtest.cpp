@@ -141,20 +141,17 @@ int main(int argc, char **argv)
 		}
 		uint64_t end = offset + length;
 		std::cerr << "Downloading range [" << offset << "," << end << ") from " << options["down"] << " to stdout ..." << std::endl;
-		auto pump = std::thread([&](){
-			ssize_t size;
-			while ((size = stream.queue_net_down()) != -1) {
-				if (size) {
-					std::cerr << "Finished queuing " << size << " bytes" << std::endl;
-				} else {
-					std::unique_lock lock(streams.read_mutex);
-					streams.reading.wait(lock);
-				}
-			}
+		std::mutex outputline;
+		streams.set_down_callback([&outputline](bufferedskystream&stream, size_t size){
+			std::scoped_lock lock(outputline);
+	                std::cerr << "Finished queuing download of " << size << " bytes" << std::endl;
 		});
 		while (offset < end) {
 			auto data = stream.xfer_local_down(offset, end);
-			std::cerr << "Downloaded " << data.size() << " bytes" << std::endl;
+			{
+				std::scoped_lock lock(outputline);
+				std::cerr << "Downloaded " << data.size() << " bytes" << std::endl;
+			}
 			size_t suboffset = 0;
 			while (suboffset < data.size()) {
 				ssize_t size = write(1, data.data() + suboffset, data.size() - suboffset);
@@ -166,8 +163,7 @@ int main(int argc, char **argv)
 			}
 			offset += data.size();
 		}
-		stream.shutdown();
-		pump.join();
+		streams.shutdown();
 	} else if (options.count("up")) {
 		if (!options["up"].size()) {
 			options["up"] = options["pos1"];
@@ -185,17 +181,11 @@ int main(int argc, char **argv)
 		data.reserve(1024*1024*16);
 		data.resize(data.capacity());
 		ssize_t size;
-		auto pump = std::thread([&](){
-			ssize_t size;
-			while ((size = stream.xfer_net_up()) != -1) {
-				if (size) {
-					json2file(stream.identifiers(), options["up"]);
-					std::cerr << "Uploaded " << size << " bytes" << std::endl;
-				} else {
-					std::unique_lock lock(streams.write_mutex);
-					streams.writing.wait(lock);
-				}
-			}
+		std::mutex outputline;
+		streams.set_up_callback([&outputline,&options](bufferedskystream&stream, size_t size){
+			json2file(stream.identifiers(), options["up"]);
+			std::scoped_lock lock(outputline);
+			std::cerr << "Uploaded " << size << " bytes" << std::endl;
 		});
 		while ((size = read(0, data.data(), data.size()))) {
 			if (size < 0) {
@@ -204,11 +194,13 @@ int main(int argc, char **argv)
 			}
 			data.resize(size);
 			stream.queue_local_up(std::move(data));
-			//std::cerr << "Queued " << size << " bytes" << std::endl;
+			{
+				std::scoped_lock lock(outputline);
+				std::cerr << "Queued upload of " << size << " bytes" << std::endl;
+			}
 			offset += size;
 			data.resize(data.capacity());
 		}
-		stream.shutdown();
-		pump.join();
+		streams.shutdown();
 	}
 }

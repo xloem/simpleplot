@@ -4,23 +4,70 @@
 
 #include "skystream.hpp"
 
+// we added rading/writing conditions to wait on in net pumps.
+// they have a small race problem because a shared variable is not used.
+// the nets are the pumps and the locals are the requests
+
+// we want to proces most-needy
+// the condition variable is when something becomes needy
+// then we have a shared variable for how needy
+// protected by a mutex.
+
+// seems time to make a bufferedskystreams class
+// so a pointer to it can be passed to bufferedskystream
+
+// runs the net pumps of multiple skystreams together
+class bufferedskystream;
+class bufferedskystreams
+{
+friend class bufferedskystream;
+public:
+	bufferedskystreams(sia::portalpool & portalpool, size_t maxblocksize = 1024*1024*128)
+	: portalpool(portalpool),
+	  maxblocksize(maxblocksize)
+	{}
+
+	void add(nlohmann::json identifiers = {});
+
+	size_t size()
+	{
+		return streams.size();
+	}
+
+	bufferedskystream & get(size_t index)
+	{
+		return *streams[index];
+	}
+
+//private:
+	std::vector<std::unique_ptr<bufferedskystream>> streams;
+	sia::portalpool & portalpool;
+	size_t maxblocksize;
+	std::condition_variable reading;
+	std::condition_variable writing;
+	uint64_t biggest_read_queue_size;
+	uint64_t biggest_write_queue_size;
+	std::mutex read_mutex;
+	std::mutex write_mutex;
+};
+
 class bufferedskystream : public skystream
 {
 public:
 	using skystream::skystream;
-	bufferedskystream(sia::portalpool & portalpool, std::mutex & groupmutex, std::condition_variable & reading, size_t maxblocksize = 1024*1024*128)
-	: skystream(portalpool),
-	  groupmutex(groupmutex),
-	  reading(reading),
-	  maxblocksize(maxblocksize)
+	bufferedskystream(bufferedskystreams & group)
+	: skystream(group.portalpool),
+	  reading(group.reading),
+	  writing(group.writing),
+	  maxblocksize(group.maxblocksize)
 	{
 		start();
 	}
-	bufferedskystream(nlohmann::json identifiers, sia::portalpool & portalpool, std::mutex & groupmutex, std::condition_variable & reading, size_t maxblocksize = 1024*1024*128)
-	: skystream(identifiers, portalpool),
-	  groupmutex(groupmutex),
-	  reading(reading),
-	  maxblocksize(maxblocksize)
+	bufferedskystream(nlohmann::json identifiers, bufferedskystreams & group)
+	: skystream(identifiers, group.portalpool),
+	  reading(group.reading),
+	  writing(group.writing),
+	  maxblocksize(group.maxblocksize)
 	{
 		start();
 	}
@@ -46,6 +93,7 @@ public:
 			pumping = false;
 		}
 		reading.notify_all();
+		writing.notify_all();
 	}
 
 	uint64_t sizeup()
@@ -91,90 +139,80 @@ public:
 						toupload = maxblocksize*2 - queueup.size() ;
 					}
 				}
-				// TODO: don't drop data on shutdown, certainly not mid-request
-				if (!pumping) {
-					lock.unlock();
-					moredataup.notify_all();
-					return;
-				}
 				queueup.insert(queueup.end(), data.begin() + uploaded, data.begin() + uploaded + toupload);
 			}
-			moredataup.notify_all();
+			writing.notify_all();
 			uploaded += toupload;
 		}
 	}
 
+
+	// pumps one transfer cycle for downloads, returns bytes pumped or -1 if shut down
 	ssize_t queue_net_down()
 	{
-		// we want to loop over the length, queueing downloaders as they
-		// are available.
 		size_t offset = 0;
 		size_t tail = 0;
-		while ("pumploop") {
-			{ // get current request
-				std::unique_lock<std::mutex> lock(mutex);
-				offset = offsetdown;
-				tail = taildown;
+		{ // get current request
+			std::unique_lock<std::mutex> lock(mutex);
+			offset = offsetdown;
+			tail = taildown;
+		}
+		{ // check for shutdown
+			std::unique_lock<std::mutex> lock(mutex);
+			if  (!pumping) {
+				lock.unlock();
+				moredatadown.notify_all();
+				return -1;
 			}
-			{ // check for shutdown
-				std::unique_lock<std::mutex> lock(mutex);
-				if  (!pumping) {
-					lock.unlock();
-					moredatadown.notify_all();
-					return -1;
-				}
-			}
-			// check if the request has content
-			if (offset >= tail) {
-				// no: wait for another?
-				std::unique_lock<std::mutex> grouplock(groupmutex);
-				reading.wait(grouplock);
-				continue;
-			}
-			sia::portalpool::worker const * worker = 0;
-			size_t startpos = offset;
-			try {
-				//std::cerr << "Looking for workers to download " << offset << " to " << tail << std::endl;
+		}
+		// check if the request has content
+		if (offset >= tail) {
+			// no
+			return 0;
+		}
+		sia::portalpool::worker const * worker = 0;
+		size_t startpos = offset;
+		try {
+			//std::cerr << "Looking for workers to download " << offset << " to " << tail << std::endl;
 
-				// The first reason this is slow appears to be the time spent downloading the tree in the block_span call.  This call would be avoided by downloading by index instead of by bytes.
+			// The first reason this is slow appears to be the time spent downloading the tree in the block_span call.  This call would be avoided by downloading by index instead of by bytes.
 
-				// start by waiting for at least one
-				while (0 == (worker = portalpool.takeworkerout(sia::skynet_multiportal::download, false))) {
-					std::unique_lock<std::mutex> lock(portalpool.worker_lists);
-					portalpool.worker_free.wait(lock);
-				}
-				auto range = block_span("bytes", offset, worker);
-				auto d = new downloader(*this, worker, range.first, range.second);
+			// start by waiting for at least one
+			while (0 == (worker = portalpool.takeworkerout(sia::skynet_multiportal::download, false))) {
+				std::unique_lock<std::mutex> lock(portalpool.worker_lists);
+				portalpool.worker_free.wait(lock);
+			}
+			auto range = block_span("bytes", offset, worker);
+			auto d = new downloader(*this, worker, range.first, range.second);
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				queuedown[range.first] = std::unique_ptr<downloader>(d);
+			}
+			worker = 0;
+			offset = range.second;
+			// then add more if there are free workers
+			while ((worker = portalpool.takeworkerout(sia::skynet_multiportal::download, false))) {
+				range = block_span("bytes", offset, worker);
+				d = new downloader(*this, worker, range.first, range.second);
 				{
 					std::unique_lock<std::mutex> lock(mutex);
 					queuedown[range.first] = std::unique_ptr<downloader>(d);
 				}
 				worker = 0;
 				offset = range.second;
-				// then add more if there are free workers
-				while ((worker = portalpool.takeworkerout(sia::skynet_multiportal::download, false))) {
-					range = block_span("bytes", offset, worker);
-					d = new downloader(*this, worker, range.first, range.second);
-					{
-						std::unique_lock<std::mutex> lock(mutex);
-						queuedown[range.first] = std::unique_ptr<downloader>(d);
-					}
-					worker = 0;
-					offset = range.second;
-					range = block_span("bytes", offset);
-				}
-			} catch (std::out_of_range) { } // thrown at end of stream
-					// note workers and calls to block_span
-					// are ordered so as to workaround not
-					// having implemented RAII for struct worker
-					// in the face of the out_of_range exception
-			{
-				std::unique_lock<std::mutex> lock(mutex);
-				//std::cerr << "::downloading to " << offset << " with " << queuedown.size() << " workers " << std::endl;
-				//std::cerr << "pool now has " << portalpool.available_down() << " available."  << std::endl;
+				range = block_span("bytes", offset);
 			}
-			return offset - startpos;
+		} catch (std::out_of_range) { } // thrown at end of stream
+				// note workers and calls to block_span
+				// are ordered so as to workaround not
+				// having implemented RAII for struct worker
+				// in the face of the out_of_range exception
+		{
+			std::unique_lock<std::mutex> lock(mutex);
+			//std::cerr << "::downloading to " << offset << " with " << queuedown.size() << " workers " << std::endl;
+			//std::cerr << "pool now has " << portalpool.available_down() << " available."  << std::endl;
 		}
+		return offset - startpos;
 	}
 
 	std::mutex read_mutex;
@@ -224,47 +262,47 @@ public:
 		}
 	}
 
+	// pump one transfer cycle for uploads, return bytes pumped or -1 if shut down
 	ssize_t xfer_net_up()
 	{
-		while ("pumploop") {
-			std::vector<uint8_t> data;
-
-			{
-				std::unique_lock<std::mutex> lock(mutex);
-				while (pumping && queueup.size() == 0) {
-					moredataup.wait(lock);
-				}
-				if (!pumping && queueup.size() == 0) {
+		std::vector<uint8_t> data;
+		size_t offset;
+		{
+			std::unique_lock<std::mutex> lock(mutex);
+			if (!pumping) {
+				if (queueup.size() == 0) {
 					lock.unlock();
 					uploaded.notify_all();
 					return -1;
 				}
-				if (maxblocksize <= 0 || queueup.size() <= maxblocksize) {
-					data = std::move(queueup);
-				} else {
-					data.clear();
-					data.insert(data.begin(), queueup.begin(), queueup.begin() + maxblocksize);
-					queueup.erase(queueup.begin(), queueup.begin() + maxblocksize);
-				}
+			} else if (queueup.size() == 0) {
+				return 0;
 			}
-			if (data.size()) {
-				write(data, "bytes", offsetup);
-				{
-					std::lock_guard<std::mutex> lock(mutex);
-					offsetup += data.size();
-				}
-				uploaded.notify_all();
+			// pull data to transfer into local variable
+			if (maxblocksize <= 0 || queueup.size() <= maxblocksize) {
+				data = std::move(queueup);
+			} else {
+				data.insert(data.begin(), queueup.begin(), queueup.begin() + maxblocksize);
+				queueup.erase(queueup.begin(), queueup.begin() + maxblocksize);
 			}
-			return data.size();
+			offset = offsetup;
 		}
+		if (data.size()) {
+			write(data, "bytes", offset);
+			{
+				std::lock_guard<std::mutex> lock(mutex);
+				offsetup += data.size();
+			}
+			uploaded.notify_all();
+		}
+		return data.size();
 	}
 
-	std::mutex & groupmutex; 
-	std::condition_variable & reading; // notified when read is requested
+	std::condition_variable & reading; // notified after any read is requested
+	std::condition_variable & writing; // notified after any write is requested
 
 	std::mutex mutex;
 	std::condition_variable uploaded; // notified when write queue is emptied
-	std::condition_variable moredataup; // notified when write queue lengthens
 	std::condition_variable moredatadown; // notified when read queue lengthens
 
 private:
@@ -317,6 +355,15 @@ private:
 	size_t maxblocksize;
 	std::map<size_t, std::unique_ptr<downloader>> queuedown;
 	std::vector<uint8_t> queueup;
-	size_t offsetup;
 	size_t offsetdown, taildown;
+	size_t offsetup;
 };
+
+void bufferedskystreams::add(nlohmann::json identifiers)
+{
+	if (identifiers.empty()) {
+		streams.emplace_back(new bufferedskystream(*this));
+	} else {
+		streams.emplace_back(new bufferedskystream(identifiers, *this));
+	}
+}

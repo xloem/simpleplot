@@ -13,7 +13,11 @@ nlohmann::json file2json(std::string filename)
 	std::ifstream file(filename);
 	std::ostringstream ss;
 	ss << file.rdbuf();
-	return nlohmann::json::parse(ss.str());
+	try {
+		return nlohmann::json::parse(ss.str());
+	} catch (nlohmann::detail::parse_error) {
+		return nlohmann::json{};
+	}
 }
 
 void json2file(nlohmann::json json, std::string filename)
@@ -116,8 +120,7 @@ int main(int argc, char **argv)
 		std::cout << range.first << std::endl;
 		std::cout << range.second << std::endl;
 	}
-	std::mutex groupmutex;
-	std::condition_variable reading;
+	bufferedskystreams streams(pool);
 	if (options.count("down")) {
 		if (!options["down"].size()) {
 			options["down"] = options["pos1"];
@@ -126,7 +129,8 @@ int main(int argc, char **argv)
 			options["down"] = "skystream.json";
 			std::cerr << "No --down=, assuming " << options["down"] << std::endl;
 		}
-		bufferedskystream stream(file2json(options["down"]), pool, groupmutex, reading);
+		streams.add(file2json(options["down"]));
+		auto & stream = streams.get(0);
 
 		auto range = stream.span("bytes");
 		if (range.first > offset) {
@@ -142,6 +146,9 @@ int main(int argc, char **argv)
 			while ((size = stream.queue_net_down()) != -1) {
 				if (size) {
 					std::cerr << "Finished queuing " << size << " bytes" << std::endl;
+				} else {
+					std::unique_lock lock(streams.read_mutex);
+					streams.reading.wait(lock);
 				}
 			}
 		});
@@ -169,13 +176,8 @@ int main(int argc, char **argv)
 			options["up"] = "skystream.json";
 			std::cerr << "No --up=, assuming " << options["up"] << std::endl;
 		}
-		std::unique_ptr<bufferedskystream> streamptr;
-		try {
-			streamptr.reset(new bufferedskystream(file2json(options["up"]), pool, groupmutex, reading));
-		} catch (nlohmann::detail::parse_error) {
-			streamptr.reset(new bufferedskystream(pool, groupmutex, reading));
-		}
-		bufferedskystream & stream = *streamptr;
+		streams.add(file2json(options["up"]));
+		bufferedskystream & stream = streams.get(0);
 		auto range = stream.span("bytes");
 		double offset = range.second;
 		std::cerr << "Uploading to " << options["up"] << " from stdin starting from " << "bytes" << " " << offset << std::endl;
@@ -186,11 +188,14 @@ int main(int argc, char **argv)
 		auto pump = std::thread([&](){
 			ssize_t size;
 			while ((size = stream.xfer_net_up()) != -1) {
-				if (size != 0) {
+				if (size) {
 					json2file(stream.identifiers(), options["up"]);
 					std::cerr << "Uploaded " << size << " bytes" << std::endl;
+				} else {
+					std::unique_lock lock(streams.write_mutex);
+					streams.writing.wait(lock);
 				}
-			};
+			}
 		});
 		while ((size = read(0, data.data(), data.size()))) {
 			if (size < 0) {

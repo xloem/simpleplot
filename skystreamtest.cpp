@@ -68,26 +68,29 @@ int main(int argc, char **argv)
 {
 	auto options = parseoptions(argc, argv, {
 		{"up", optional_argument, 0, 'u'},
-		{"down", required_argument, 0, 'd'},
-		{"span", required_argument, 0, 's'},
+		{"down", optional_argument, 0, 'd'},
+		{"size", optional_argument, 0, 's'},
+		{"span", required_argument, 0, 'n'},
 		{"offset", required_argument, 0, 'o'},
 		{"length", required_argument, 0, 'l'},
 		{"help", no_argument, 0, 'h'}
 	});
-	if (!options.count("down") && !options.count("up")) {
+	if (!options.count("down") && !options.count("up") && !options.count("size")) {
 		if (options.count("pos1")) {
 			options["down"] = options["pos1"];
+			std::cerr << "Assuming you mean to download from " << options["down"] << std::endl;
 		} else {
+			std::cerr << "Assuming you mean to upload" << std::endl;
 			options["up"] = "";
 		}
 	}
-	if (options.count("help")) {
+	if (options.count("help") ) {
 		std::cerr << "Specify --up or --down json file; see source for options." << std::endl;
 		return 0;
 	}
 
-	if (options.count("down") && options.count("up")) {
-		std::cerr << "Launch two processes to both upload and download." << std::endl;
+	if (options.count("down") + options.count("up") + options.count("size") > 1) {
+		std::cerr << "Launch multiple processes to do multiple things." << std::endl;
 		return -1;
 	}
 
@@ -105,20 +108,33 @@ int main(int argc, char **argv)
 	if (options.count("span")) {
 		span = options["span"];
 	}
+	if (options.count("size")) {
+		if (!options["size"].size()) {
+			options["size"] = "skystream.json";
+		}
+		skystream stream(file2json(options["size"]), pool);
+		auto range = stream.span(span);
+		std::cout << range.first << std::endl;
+		std::cout << range.second << std::endl;
+	}
 	if (options.count("down")) {
-		std::cerr << "Downloading from " << options["down"] << " to stdout starting from " << span << " " << offset << std::endl;
+		if (!options["down"].size()) {
+			options["down"] = "skystream.json";
+		}
 		skystream stream(file2json(options["down"]), pool);
 
 		auto range = stream.span(span);
 		if (range.first > offset) {
 			offset = range.first;
 		}
+		std::cerr << "Downloading from " << options["down"] << " to stdout starting from " << span << " " << offset << std::endl;
 		if (length == 0 || length + offset > range.second) {
 			length = range.second - offset;
 		}
 		double end = offset + length;
 		while (offset < end) {
 			auto data = stream.read(span, offset);
+			std::cerr << "Downloaded " << data.size() << " bytes" << std::endl;
 			size_t suboffset = 0;
 			while (suboffset < data.size()) {
 				ssize_t size = write(1, data.data() + suboffset, data.size() - suboffset);
@@ -135,7 +151,6 @@ int main(int argc, char **argv)
 		if (!options["up"].size()) {
 			options["up"] = "skystream.json";
 		}
-		std::cerr << "Uploading to " << options["up"] << " from stdout starting from " << span << " " << offset << std::endl;
 		std::unique_ptr<skystream> streamptr;
 		try {
 			streamptr.reset(new skystream(file2json(options["up"]), pool));
@@ -145,6 +160,7 @@ int main(int argc, char **argv)
 		skystream & stream = *streamptr;
 		auto range = stream.span(span);
 		double offset = range.second;
+		std::cerr << "Uploading to " << options["up"] << " from stdout starting from " << span << " " << offset << std::endl;
 		std::vector<uint8_t> data;
 		data.reserve(1024*1024*16);
 		data.resize(data.capacity());
@@ -157,6 +173,7 @@ int main(int argc, char **argv)
 			}
 			data.resize(size);
 			stream.write(data, "bytes", offset);
+			std::cerr << "Uploaded " << data.size() << " bytes" << std::endl;
 			offset += data.size();
 			data.resize(data.capacity());
 		}

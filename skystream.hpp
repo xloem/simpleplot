@@ -5,7 +5,7 @@
 #include <unordered_map>
 
 // iostreams for debug
-#include <iostream>
+//#include <iostream>
 
 #include <nlohmann/json.hpp>
 
@@ -267,7 +267,7 @@ public:
 			{"lookup", lookup_nodes}
 		};
 		std::string metadata_string = metadata_json.dump();
-		std::cerr << metadata_string << std::endl;
+		//std::cerr << metadata_string << std::endl;
 
 		sia::skynet::upload_data metadata_upload("metadata.json", std::vector<uint8_t>{metadata_string.begin(), metadata_string.end()}, "application/json");
 		sia::skynet::upload_data content("content", data, "application/octet-stream");

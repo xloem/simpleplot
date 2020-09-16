@@ -2,6 +2,9 @@
 
 #include <thread>
 
+// For outputting a message on stderr when a portal fails
+#include <iostream>
+
 namespace sia {
 
 class portalpool {

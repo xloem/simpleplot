@@ -48,6 +48,7 @@ void create_plot(uint64_t account_id,
 
 #include "skystream.hpp"
 
+/*
 class BufferedSkystream : public skystream
 {
 public:
@@ -203,6 +204,351 @@ private:
 	bool pumping = true;
 	std::thread threadup;
 	std::thread threaddown;
+	std::condition_variable moredataup;
+	std::condition_variable moredatadown;
+	std::vector<uint8_t> queueup;
+	std::vector<uint8_t> queuedown;
+	size_t offsetup;
+	size_t offsetdown;
+};
+*/
+
+class BufferedSkystream : public skystream
+{
+public:
+	using skystream::skystream;
+	BufferedSkystream(sia::portalpool & portalpool, std::mutex & groupmutex, std::condition_variable & reading)
+	:skystream(portalpool),groupmutex(groupmutex),reading(reading) {start();}
+	BufferedSkystream(nlohmann::json identifiers, sia::portalpool & portalpool, std::mutex & groupmutex, std::condition_variable & reading)
+	:skystream(identifiers, portalpool),groupmutex(groupmutex),reading(reading) {start();}
+
+	BufferedSkystream(BufferedSkystream const &) = default;
+	BufferedSkystream(BufferedSkystream &&) = default;
+
+	~BufferedSkystream()
+	{
+		if (backlogs()) {
+			throw std::runtime_error("not flushed");
+		}
+	}
+
+	uint64_t size()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		return offsetup;
+	}
+	uint64_t backlog()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		return queueup.size();
+	}
+	uint64_t uploadedsize()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		return offsetup - queueup.size();
+	}
+	std::pair<uint64_t,uint64_t> uploaded_and_total()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		return {offsetup - queueup.size(), offsetup};
+	}
+	void basictipmetadata(nlohmann::json & identifiers, uint64_t & uploaded, uint64_t & total)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		identifiers = skystream::identifiers();
+		total = offsetup;
+		uploaded = total - queueup.size();
+	}
+
+	void queue_local_up(std::vector<uint8_t> && data, size_t maxsize = 0)
+	{
+		size_t uploaded = 0;
+		while (uploaded < data.size()) {
+			size_t toupload = data.size() - uploaded;
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				if (maxsize > 0 && queueup.size() >= maxsize) {
+					uploaded.wait(lock, [&]() {
+						return !pumping || queueup.size() < maxsize;
+					});
+				}
+				if (!pumping) {
+					lock.unlock();
+					moredataup.notify_all();
+					return;
+				}
+				if (queueup.size() + toupload > maxsize) {
+					toupload = maxsize - queueup.size() ;
+				}
+				queueup.insert(queueup.end(), data.begin() + uploaded, data.begin() + uploaded + toupload);
+			}
+			moredataup.notify_all();
+			uploaded += toupload;
+		}
+	}
+
+	size_t queue_net_down()
+	{
+		ssize_t offset = -1;
+		while ("pumploop") {
+			std::vector<uint8_t> data;
+			{
+				{
+					std::unique_lock<std::mutex> lock(mutex);
+					offset = offsetdown;
+				}
+				if (offset == -1) {
+					std::unique_lock<std::mutex> grouplock(groupmutex);
+					reading.wait(grouplock);
+				}
+				{
+					std::unique_lock<std::mutex> lock(mutex);
+					if  (!pumping) {
+						lock.unlock();
+						moredatadown.notify_all();
+						return;
+					}
+				}
+			}
+			if (offset != -1) {
+				auto data = skystream::read("bytes", offset);
+				offset += data.size();
+				{
+					std::lock_guard<std::mutex> lock(mutex);
+					queuedown.insert(queuedown.end(), data.begin(), data.end());
+					offsetdown = offset;
+				}
+				moredatadown.notify_all();
+				return data.size();
+			} 
+		}
+	}
+
+	std::mutex read_mutex;
+	std::vector<uint8_t> xfer_local_down(uint64_t offset)
+	{
+		reading.notify_all();
+		std::lock_guard<std::mutex> read_lock(read_mutex);
+		std::unique_lock<std::mutex> lock(mutex);
+		offsetdown = offset;
+		queuedown.clear();
+		moredatadown.wait(lock, [&]() {
+			return !pumping || queuedown.size() != 0;
+		});
+		std::vector<uint8_t> data = std::move(queuedown);
+		return data;
+	}
+	void done_local_down()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		offsetdown = -1;
+		queuedown.clear();
+	}
+
+	void xfer_net_up()
+	{
+		while ("pumploop") {
+			std::vector<uint8_t> data;
+
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				moredataup.wait(lock, [&]() {
+					return !pumping || queueup.size() != 0;
+				});
+				if (!pumping && queueup.size() == 0) {
+					lock.unlock();
+					uploaded.notify_all();
+					return;
+				}
+				data = std::move(queueup);
+			}
+			if (data.size()) {
+				write(data, "bytes", offsetup);
+				{
+					std::lock_guard<std::mutex> lock(mutex);
+					offsetup += data.size();
+				}
+				uploaded.notify_all();
+				return;
+			}
+		}
+	}
+
+	std::mutex & groupmutex; 
+	std::condition_variable & reading; // notified when read is requested
+
+	std::mutex mutex;
+	std::condition_variable uploaded; // notified when write queue is emptied
+	std::condition_variable moredataup; // notified when write queue lengthens
+	std::condition_variable moredatadown; // notified when read queue lengthens
+
+private:
+	void stop()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (!pumping) {
+				return;
+			}
+			pumping = false;
+		}
+	}
+	void start()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		offsetup = span("bytes").second;
+		offsetdown = -1;
+	}
+	bool pumping = true;
+	std::vector<uint8_t> queueup;
+	std::vector<uint8_t> queuedown;
+	size_t offsetup;
+	size_t offsetdown;
+};
+
+class BufferedSkystreams
+{
+public:
+	BufferedSkystream()
+	{
+		activedown = 0;
+		threaddown = std::thread(&BufferedSkystreams::pumpdown, this);
+		threaddown.detach();
+		threadup = std::thread(&BufferedSkystream::pumpup, this);
+		threadup.detach();
+	}
+	
+	void add(nlohmann::json identifiers, sia::portalpooly & portalpool)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		streams.emplace_back(new BufferedSkystream(identifiers, portalpool);
+	}
+
+	~BufferedSkystream()
+	{
+		shutdown();
+	}
+
+	void shutdown()
+	{
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (!pumping) {
+				return;
+			}
+			pumping = false;
+		}
+		threadup.join();
+		threaddown.join();
+	}
+
+	std::pair<uint64_t,uint64_t> uploaded_and_total()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		uint64_t maxsize = 0;
+		int64_t minsize = -1;
+		for (auto stream : streams) {
+			auto bounds = stream.uploaded_and_total();
+			if (bounds.second > maxsize) {
+				maxsize = bounds.second;
+			}
+			if (minsize == -1 || bounds.first < minsize) {
+				minsize = bounds.first;
+			}
+		}
+		return {minsize,maxsize};
+	}
+
+	void queue_local_up(size_t stream, std::vector<uint8_t> && data, size_t maxsize = 0)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		streams[stream]->queue_local_up(data, maxsize);
+	}
+
+	std::vector<uint8_t> xfer_local_down(size_t stream, uint64_t offset)
+	{
+		BufferedSkystream * streamptr;
+		{
+			std::unique_lock<std::mutex> lock(mutex);
+			streamptr = streams[stream];
+		}
+		return streamptr->xfer_local_down(offset);
+	}
+	void done_local_down()
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		if (activedown != 0) {
+			activedown->done_local_down();
+			activedown = 0;
+		}
+	}
+
+private:
+
+	// download needs step-through
+	void pumpdown()
+	{
+		while ("pumploop") {
+			BufferedSkystream * stream;
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				while (activedown == 0 && pumping) {
+					reading.wait(lock);
+				}
+				if  (!pumping) {
+					return;
+				}
+				stream = activedown;
+			}
+			stream->queue_net_down();
+		}
+	}
+
+	void pumpup()
+	{
+		while ("pumploop") {
+			BufferedSkystream * streamptr;
+			uint64_t maxbacklog = 0;
+			{
+				std::unique_lock<std::mutex> lock(mutex);
+				for (auto stream: streams) {
+					uint64_t backlog = stream->backlog();
+					if (backlog > maxbacklog) {
+						maxbacklog = backlog;
+						streamptr = stream;
+					}
+				}
+			}
+			if (maxbacklog == 0) {
+				std::unique_lock<std::mutex> lock(mutex);
+				wrote.wait(lock);
+				continue;
+			}
+			// does this work?
+			// 	spawn a thread that calls the upload function
+			// a little, but leaves race unless we can pass worker in.
+
+			// simpler: make a new pump queue.
+			// each has a thread.
+			// LEFT OFF HERE
+			stream->xfer_net_up();
+		}
+	}
+
+	sia::portalpool portalpool;
+	std::vector<std::unique_ptr<BufferedSkystream>> streams;
+
+
+	bool pumping = true;
+	std::mutex mutex;
+
+	std::condition_variable reading; // notified when read is requested
+	BufferedSkystream * activedown;
+	std::thread threaddown;
+
+	std::condition_variable wrote; // notified when data is written
+	std::thread threadup;
+
 	std::condition_variable moredataup;
 	std::condition_variable moredatadown;
 	std::vector<uint8_t> queueup;

@@ -6,12 +6,16 @@ namespace sia {
 
 class portalpool {
 public:
-	portalpool(double bytes_bandwidth_down = 1024, double bytes_bandwidth_up = 1024, size_t num_simultaneous_xfers = 4)
-	: bandwidth{bytes_bandwidth_down / num_simultaneous_xfers, bytes_bandwidth_up / num_simultaneous_xfers},
-	  all_workers(num_simultaneous_xfers)
+	portalpool(double bytes_bandwidth_down = 1024, double bytes_bandwidth_up = 1024, size_t connections_down = 4, size_t connections_up = 4)
+	: bandwidth{bytes_bandwidth_down / connections_down, bytes_bandwidth_up / connections_up}
 	{
-		for (auto & worker: all_workers) {
-			free_workers.push_back(&worker);
+		for (size_t i = 0; i < connections_down; ++ i) {
+			workers[skynet_multiportal::download].emplace_back(worker{i, std::unique_ptr<skynet>(new skynet())});
+			free[skynet_multiportal::download].push_back(i);
+		}
+		for (size_t i = 0; i < connections_up; ++ i) {
+			workers[skynet_multiportal::upload].emplace_back(worker{i, std::unique_ptr<skynet>(new skynet())});
+			free[skynet_multiportal::upload].push_back(i);
 		}
 	}
 
@@ -19,18 +23,15 @@ public:
 	{
 		auto timeout = std::chrono::milliseconds((unsigned long)(1000 * maxsize / bandwidth[skynet_multiportal::download]));
 
-		auto & worker = takeworkerout();
 		while ("retrying download") {
-			auto xfer = multiportal.begin_transfer(skynet_multiportal::download);
-			worker.portal.options = xfer.portal;
+			auto & worker = takeworkerout(skynet_multiportal::download);
 			try {
-				auto response = worker.portal.download(skylink, ranges, timeout);
-				multiportal.end_transfer(xfer, response.data.size() + response.filename.size());
-				putworkerback(worker);
+				auto response = worker.portal->download(skylink, ranges, timeout);
+				putworkerback(worker, response.data.size() + response.filename.size());
 				return response;
 			} catch(std::runtime_error const & e) {
-				std::cerr << xfer.portal.url << ": " << e.what() << std::endl;
-				multiportal.end_transfer(xfer, 0);
+				std::cerr << worker.portal->options.url << ": " << e.what() << std::endl;
+				putworkerback(worker, 0);
 				if (fail) { return {}; }
 			}
 		}
@@ -45,21 +46,33 @@ public:
 		auto timeout = std::chrono::milliseconds((unsigned long)(1000 * size / bandwidth[skynet_multiportal::upload]));
 		
 		std::string link;
-		auto & worker = takeworkerout();
 		while ("retrying upload") {
-			auto xfer = multiportal.begin_transfer(skynet_multiportal::upload);
-			worker.portal.options = xfer.portal;
+			auto & worker = takeworkerout(skynet_multiportal::upload);
 			try {
-				std::string link = worker.portal.upload(filename, files, timeout);
-				multiportal.end_transfer(xfer, size);
-				putworkerback(worker);
+				std::string link = worker.portal->upload(filename, files, timeout);
+				putworkerback(worker, size);
 				return link;
 			} catch(std::runtime_error const & e) {
-				std::cerr << xfer.portal.url << ": " << e.what() << std::endl;
-				multiportal.end_transfer(xfer, 0);
+				std::cerr << worker.portal->options.url << ": " << e.what() << std::endl;
+				putworkerback(worker, 0);
 				if (fail) { return {}; }
 			}
 		}
+	}
+
+	std::mutex worker_lists;
+	std::condition_variable worker_free;
+
+	size_t available_down()
+	{
+		std::unique_lock<std::mutex> lock(worker_lists);
+		return free[skynet_multiportal::download].size();
+	}
+
+	size_t available_up()
+	{
+		std::unique_lock<std::mutex> lock(worker_lists);
+		return free[skynet_multiportal::upload].size();
 	}
 	
 private:
@@ -67,29 +80,35 @@ private:
 	sia::skynet_multiportal multiportal;
 
 	struct worker {
-		skynet portal;
-		std::mutex mutex;
+		size_t index;
+		std::unique_ptr<skynet> portal;
+		skynet_multiportal::transfer transfer;
 	};
-	std::vector<worker> all_workers;
-	std::vector<worker*> free_workers;
-	std::mutex worker_lists;
-	std::condition_variable worker_free;
+	
+	std::vector<worker> workers[2];
+	std::vector<size_t> free[2];
 
-	worker & takeworkerout() {
-		std::unique_lock<std::mutex> lock(worker_lists);
-		if (!free_workers.size()) {
-			worker_free.wait(lock, [this](){
-				return free_workers.size() > 0;
-			});
+	worker & takeworkerout(skynet_multiportal::transfer_kind kind) {
+		worker * w;
+		{
+			std::unique_lock<std::mutex> lock(worker_lists);
+			while (!free[kind].size()) {
+				worker_free.wait(lock);
+			}
+			w = &workers[kind][free[kind].back()];
+			free[kind].pop_back();
 		}
-		worker * w = free_workers.back();
-		free_workers.pop_back();
+		w->transfer = multiportal.begin_transfer(kind);
+		w->portal->options = w->transfer.portal;
 		return *w;
 	}
 
-	void putworkerback(worker & w) {
-		std::unique_lock<std::mutex> lock(worker_lists);
-		free_workers.push_back(&w);
+	void putworkerback(worker & w, size_t size) {
+		multiportal.end_transfer(w.transfer, size);
+		{
+			std::unique_lock<std::mutex> lock(worker_lists);
+			free[w.transfer.kind].push_back(w.index);
+		}
 		worker_free.notify_all();
 	}
 };

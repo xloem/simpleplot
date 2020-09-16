@@ -55,7 +55,7 @@ public:
 	skystream(skystream const &) = default;
 	skystream(skystream &&) = default;
 
-	std::vector<uint8_t> read(std::string span, double offset, std::string flow = "real")
+	std::vector<uint8_t> read(std::string span, double & offset, std::string flow = "real")
 	{
 		auto metadata = this->get_node(tail, span, offset).metadata;
 		std::lock_guard<std::mutex> lock(methodmtx);
@@ -68,6 +68,7 @@ public:
 	
 		auto begin = data.begin() + offset - content_start;
 		auto end = data.begin() + metadata_content["bounds"]["bytes"]["end"] - content_start;
+		offset = metadata_content["bounds"][span]["end"];
 		return {begin, end};
 	}
 

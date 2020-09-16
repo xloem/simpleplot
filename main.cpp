@@ -44,7 +44,6 @@ void create_plot(uint64_t account_id,
 
 }
 
-#include <siaskynet_multiportal.hpp>
 #include <cassert>
 
 #include "skystream.hpp"
@@ -52,10 +51,10 @@ void create_plot(uint64_t account_id,
 class BufferedSkystream : public skystream
 {
 public:
-	BufferedSkystream(sia::skynet_multiportal & multiportal)
-	:skystream(multiportal) {start();}
-	BufferedSkystream(nlohmann::json identifiers, sia::skynet_multiportal & multiportal)
-	:skystream(identifiers, multiportal) {start();}
+	BufferedSkystream(sia::portalpool & portalpool)
+	:skystream(portalpool) {start();}
+	BufferedSkystream(nlohmann::json identifiers, sia::portalpool & portalpool)
+	:skystream(identifiers, portalpool) {start();}
 
 	BufferedSkystream(BufferedSkystream const &) = default;
 	BufferedSkystream(BufferedSkystream &&) = default;
@@ -216,18 +215,18 @@ class Plotfile
 {
 public:
 	Plotfile(uint64_t account)
-	: account(account), metastream(multiportal)
+	: account(account), metastream(portalpool)
 	{
 		std::cerr << "Readying scoop pumps ..." << std::endl;
 		while (scoops.size() < sizeof(nonce::scoops) / sizeof(nonce::scoop)) {
 			metadata["scoopstreams"][scoops.size()] = nullptr;
-			scoops.emplace_back(new BufferedSkystream(multiportal));
+			scoops.emplace_back(new BufferedSkystream(portalpool));
 			std::cerr << scoops.size() << "/" << sizeof(nonce::scoops) / sizeof(nonce::scoop) << "\r" << std::flush;
 		}
 		start();
 	}
 	Plotfile(uint64_t account, nlohmann::json identifiers)
-	: account(account), metastream(identifiers, multiportal), _identifiers(identifiers)
+	: account(account), metastream(identifiers, portalpool), _identifiers(identifiers)
 	{
 		auto data = metastream.read("index", metastream.span("index").second);
 		std::string str(data.begin(), data.end());
@@ -235,7 +234,7 @@ public:
 		std::cerr << "Found metadata document. " << std::endl;
 		std::cerr << "Readying scoop pumps ..." << std::endl;
 		for (auto & identifiers :metadata["scoopstreams"]) {
-			scoops.emplace_back(new BufferedSkystream(multiportal));
+			scoops.emplace_back(new BufferedSkystream(portalpool));
 			std::cerr << scoops.size() << "/" << sizeof(nonce::scoops) / sizeof(nonce::scoop) << "\r" << std::flush;
 		}
 		start();
@@ -397,7 +396,7 @@ private:
 	// .read(string span, double offset, string flow = "real") // read from stream, returns vector
 	// spans are "bytes", "time", "index"
 	// so we could write to nonces or scoops
-	sia::skynet_multiportal multiportal;
+	sia::portalpool portalpool;
 	skystream metastream;
 	nlohmann::json metadata;
 	std::vector<std::unique_ptr<BufferedSkystream>> scoops;

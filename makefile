@@ -8,5 +8,7 @@ run: simpleplot
 
 all: simpleplot
 
+main.o: main.cpp portalpool.hpp skystream.hpp crypto.hpp
+
 simpleplot: main.o
 	$(CXX) $(LDFLAGS) $^ $(LOADLIBES) $(LDLIBS) -o $@

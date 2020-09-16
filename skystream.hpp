@@ -9,7 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <siaskynet_multiportal.hpp>
+#include "portalpool.hpp"
 
 #include "crypto.hpp"
 
@@ -23,8 +23,8 @@ seconds_t time()
 class skystream
 {
 public:
-	skystream(sia::skynet_multiportal & multiportal)
-	: multiportal(multiportal)
+	skystream(sia::portalpool & portalpool)
+	: portalpool(portalpool)
 	{
 		auto now = time();
 		tail.metadata = {
@@ -40,16 +40,16 @@ public:
 			//{"flows", {}}
 		};
 	}
-	skystream(std::string way, std::string link, sia::skynet_multiportal & multiportal)
-	: multiportal(multiportal)
+	skystream(std::string way, std::string link, sia::portalpool & portalpool)
+	: portalpool(portalpool)
 	{
 		std::vector<uint8_t> data;
 		tail.metadata = get_json({{way,link}});
 		tail.identifiers = cryptography.digests({&data});
 		tail.identifiers[way] = link;
 	}
-	skystream(nlohmann::json identifiers, sia::skynet_multiportal & multiportal)
-	: tail{identifiers, get_json(identifiers)}, multiportal(multiportal)
+	skystream(nlohmann::json identifiers, sia::portalpool & portalpool)
+	: tail{identifiers, get_json(identifiers)}, portalpool(portalpool)
 	{ }
 
 	skystream(skystream const &) = default;
@@ -281,22 +281,11 @@ public:
 		std::mutex skylink_mutex;
 		std::string skylink;
 		auto ensure_upload = [&]() {
-			sia::skynet portal;
-			while (true) {
-				auto transfer = multiportal.begin_transfer(sia::skynet_multiportal::upload);
-				portal.options = transfer.portal;
-				try {
-					std::string link = portal.upload(metadata_identifiers["sha3_512"], {metadata_upload, content});
-					multiportal.end_transfer(transfer, metadata_upload.data.size() + content.data.size());
-					std::lock_guard<std::mutex> lock(skylink_mutex);
-					skylink = link;
-					break;
-				} catch(std::runtime_error const & e) {
-					std::cerr << portal.options.url << ": " << e.what() << std::endl;
-					multiportal.end_transfer(transfer, 0);
-					continue;
-				}
-			}
+			std::string link = portalpool.upload(metadata_identifiers["sha3_512"], {metadata_upload, content});
+			{
+				std::lock_guard<std::mutex> lock(skylink_mutex);
+				skylink = link;
+			} 
 		};
 		auto upload1 = std::thread(ensure_upload);
 		auto upload2 = std::thread(ensure_upload);
@@ -305,7 +294,8 @@ public:
 		lock.lock();
 		metadata_identifiers["skylink"] = skylink + "/" + metadata_upload.filename;
 
-		// if we want to supporto threading we'll likely need a lock around this whole function (not just the change to tail)
+		// if we want to support threading we'll likely need a lock around this whole function (not just the change to tail)
+		// 	later: i've done that, but haven't integrated with old stuff to simplify
 		tail.identifiers = metadata_identifiers;
 		tail.metadata = metadata_json;
 	}
@@ -377,20 +367,7 @@ public:
 	std::vector<uint8_t> get(nlohmann::json identifiers)
 	{
 		auto skylink = identifiers["skylink"];
-		std::vector<uint8_t> result;
-		while (true) {
-			auto transfer = multiportal.begin_transfer(sia::skynet_multiportal::download);
-			download_portal.options = transfer.portal;
-			try {
-				result = download_portal.download(skylink).data;
-				multiportal.end_transfer(transfer, result.size());
-				break;
-			} catch(std::runtime_error const & e) {
-				std::cerr << download_portal.options.url << ": " << e.what() << std::endl;
-				multiportal.end_transfer(transfer, 0);
-				continue;
-			}
-		}
+		std::vector<uint8_t> result = portalpool.download(skylink).data;
 		auto digests = cryptography.digests({&result});
 		for (auto & digest : digests.items()) {
 			if (identifiers.contains(digest.key())) {
@@ -464,8 +441,7 @@ private:
 	//	// to do this right, consider that source's content may be in the middle of its lookups.  so you want to put it in the right spot.
 	//}
 
-	sia::skynet download_portal;
-	sia::skynet_multiportal & multiportal;
+	sia::portalpool & portalpool;
 	crypto cryptography;
 	node tail;
 	std::unordered_map<std::string, node> cache;

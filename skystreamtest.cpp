@@ -55,6 +55,7 @@ std::map<std::string, std::string> parseoptions(int argc, char **argv, std::vect
 		} else {
 			result[option.name] = {};
 		}
+		std::cerr << "Got " << option.name << " = " << result[option.name] << std::endl;
 	}
 	int posind = 0;
 	while (optind < argc) {
@@ -111,6 +112,7 @@ int main(int argc, char **argv)
 	if (options.count("size")) {
 		if (!options["size"].size()) {
 			options["size"] = "skystream.json";
+			std::cerr << "No --size=, assuming " << options["size"] << std::endl;
 		}
 		skystream stream(file2json(options["size"]), pool);
 		auto range = stream.span(span);
@@ -120,6 +122,7 @@ int main(int argc, char **argv)
 	if (options.count("down")) {
 		if (!options["down"].size()) {
 			options["down"] = "skystream.json";
+			std::cerr << "No --down=, assuming " << options["down"] << std::endl;
 		}
 		skystream stream(file2json(options["down"]), pool);
 
@@ -140,16 +143,15 @@ int main(int argc, char **argv)
 				ssize_t size = write(1, data.data() + suboffset, data.size() - suboffset);
 				if (size < 0) {
 					perror("write");
-					json2file(stream.identifiers(), options["down"]);
 					return size;
 				}
 				suboffset += size;
 			}
 		}
-		json2file(stream.identifiers(), options["down"]);
 	} else if (options.count("up")) {
 		if (!options["up"].size()) {
 			options["up"] = "skystream.json";
+			std::cerr << "No --up=, assuming " << options["up"] << std::endl;
 		}
 		std::unique_ptr<skystream> streamptr;
 		try {
@@ -168,15 +170,14 @@ int main(int argc, char **argv)
 		while ((size = read(0, data.data(), data.size()))) {
 			if (size < 0) {
 				perror("read");
-				json2file(stream.identifiers(), options["up"]);
 				return size;
 			}
 			data.resize(size);
 			stream.write(data, "bytes", offset);
 			std::cerr << "Uploaded " << data.size() << " bytes" << std::endl;
+			json2file(stream.identifiers(), options["up"]);
 			offset += data.size();
 			data.resize(data.capacity());
 		}
-		json2file(stream.identifiers(), options["up"]);
 	}
 }

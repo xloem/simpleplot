@@ -55,16 +55,16 @@ public:
 	skystream(skystream const &) = default;
 	skystream(skystream &&) = default;
 
-	std::vector<uint8_t> read(std::string span, double & offset, std::string flow = "real")
+	std::vector<uint8_t> read(std::string span, double & offset, std::string flow = "real", sia::portalpool::worker const * worker = 0)
 	{
-		auto metadata = this->get_node(tail, span, offset).metadata;
+		auto metadata = this->get_node(tail, span, offset, {}, worker).metadata;
 		std::lock_guard<std::mutex> lock(methodmtx);
 		auto metadata_content = metadata["content"];
 		double content_start = metadata_content["spans"][span]["start"];
 		if (span != "bytes" && offset != content_start) {
 			throw std::runtime_error(span + " " + std::to_string(offset) + " is within block span");
 		}
-		auto data = get(metadata_content["identifiers"]);
+		auto data = get(metadata_content["identifiers"], worker);
 	
 		auto begin = data.begin() + offset - content_start;
 		auto end = data.begin() + metadata_content["bounds"]["bytes"]["end"] - content_start;
@@ -73,7 +73,7 @@ public:
 	}
 
 	std::mutex writemtx;
-	void write(std::vector<uint8_t> & data, std::string span, double offset)
+	void write(std::vector<uint8_t> & data, std::string span, double offset, sia::portalpool::worker const * worker = 0)
 	{
 		std::lock_guard<std::mutex> writelock(writemtx);
 
@@ -92,7 +92,7 @@ public:
 			//full_size = data.size();
 		} else {
 			nlohmann::json head_node_bounds;
-			head_node = this->get_node(this->tail, span, offset);
+			head_node = this->get_node(this->tail, span, offset, {}, worker);
 			auto head_node_content = head_node.metadata["content"];
 			double start_head = head_node_content["bounds"][span]["start"];
 			start_bytes = head_node_content["bounds"]["bytes"]["start"]; 
@@ -121,7 +121,7 @@ public:
 		node * tail_node;
 		nlohmann::json tail_bounds;
 		try {
-			tail_node = &get_node(tail, "bytes", end_bytes);
+			tail_node = &get_node(tail, "bytes", end_bytes, {}, worker);
 			auto tail_node_content = tail_node->metadata["content"];
 			if (end_bytes != tail_node_content["bounds"]["bytes"]["start"]) {
 				for (auto bound : tail_node_content["bounds"].items()) {
@@ -142,7 +142,7 @@ public:
 		node preceding;
 		lookup_nodes.clear();
 		if (start_bytes > 0) { try {
-			preceding = this->get_node(tail, "bytes", start_bytes - 1); // preceding 
+			preceding = this->get_node(tail, "bytes", start_bytes - 1, {}, worker); // preceding 
 			new_lookup_node = preceding.metadata["content"];
 			new_lookup_node["identifiers"] = preceding.identifiers;
 			new_lookup_node["depth"] = 0;
@@ -301,12 +301,12 @@ public:
 		tail.metadata = metadata_json;
 	}
 
-	std::map<std::string,std::pair<double,double>> block_spans(std::string span, double offset)
+	std::map<std::string,std::pair<double,double>> block_spans(std::string span, double offset, sia::portalpool::worker const * worker = 0)
 	{
 		std::lock_guard<std::mutex> lock(methodmtx);
-		auto metadata = this->get_node(tail, span, offset).metadata;
+		auto metadata = this->get_node(tail, span, offset, {}, worker).metadata;
 		std::map<std::string,std::pair<double,double>> result;
-		for (auto & content_span : metadata["content"]["bounds"].items()) {
+		for (auto & content_span : metadata["content"]["spans"].items()) {
 			auto span = content_span.key();
 			result[span].second = content_span.value()["end"];
 			result[span].first = content_span.value()["start"];
@@ -314,9 +314,9 @@ public:
 		return result;
 	}
 
-	std::pair<double,double> block_span(std::string span, double offset)
+	std::pair<double,double> block_span(std::string span, double offset, sia::portalpool::worker const * worker = 0)
 	{
-		return block_spans(span, offset)[span];
+		return block_spans(span, offset, worker)[span];
 	}
 
 	std::map<std::string,std::pair<double,double>> spans()
@@ -365,10 +365,10 @@ public:
 		return tail.identifiers;
 	}
 
-	std::vector<uint8_t> get(nlohmann::json identifiers)
+	std::vector<uint8_t> get(nlohmann::json identifiers, sia::portalpool::worker const * worker = 0)
 	{
 		auto skylink = identifiers["skylink"];
-		std::vector<uint8_t> result = portalpool.download(skylink).data;
+		std::vector<uint8_t> result = portalpool.download(skylink, {}, 1024*1024*64, false, worker).data;
 		auto digests = cryptography.digests({&result});
 		for (auto & digest : digests.items()) {
 			if (identifiers.contains(digest.key())) {
@@ -382,6 +382,7 @@ public:
 
 protected:
 	std::mutex methodmtx;
+	sia::portalpool & portalpool;
 
 private:
 	struct node
@@ -390,7 +391,7 @@ private:
 		nlohmann::json metadata;
 	};
 
-	node & get_node(node & start, std::string span, double offset, nlohmann::json bounds = {})
+	node & get_node(node & start, std::string span, double offset, nlohmann::json bounds = {}, sia::portalpool::worker const * worker = 0)
 	{
 		auto content_spans = start.metadata["content"]["spans"];
 		auto content_span = content_spans[span];
@@ -417,7 +418,7 @@ private:
 				auto identifiers = lookup["identifiers"];
 				std::string identifier = identifiers.begin().value();
 				if (!cache.count(identifier)) {
-					cache[identifier] = node{identifiers, get_json(identifiers)};
+					cache[identifier] = node{identifiers, get_json(identifiers, nullptr, worker)};
 				}
 				return get_node(cache[identifier], span, offset, lookup_spans);
 			}
@@ -425,9 +426,9 @@ private:
 		throw std::out_of_range(span + " " + std::to_string(offset) + " out of range");
 	}
 
-	nlohmann::json get_json(nlohmann::json identifiers, std::vector<uint8_t> * data = nullptr)
+	nlohmann::json get_json(nlohmann::json identifiers, std::vector<uint8_t> * data = nullptr, sia::portalpool::worker const * worker = 0)
 	{
-		auto data_result = get(identifiers);
+		auto data_result = get(identifiers, worker);
 		if (data) { *data = data_result; }
 		auto result = nlohmann::json::parse(data_result);
 		// TODO improve (refactor?), hardcodes storage system and is slow due to 2 requests for each chunk
@@ -442,7 +443,6 @@ private:
 	//	// to do this right, consider that source's content may be in the middle of its lookups.  so you want to put it in the right spot.
 	//}
 
-	sia::portalpool & portalpool;
 	crypto cryptography;
 	node tail;
 	std::unordered_map<std::string, node> cache;

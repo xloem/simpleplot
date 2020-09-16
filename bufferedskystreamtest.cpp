@@ -55,7 +55,6 @@ std::map<std::string, std::string> parseoptions(int argc, char **argv, std::vect
 		} else {
 			result[option.name] = {};
 		}
-		std::cerr << "Got " << option.name << " = " << result[option.name] << std::endl;
 	}
 	int posind = 0;
 	while (optind < argc) {
@@ -106,6 +105,9 @@ int main(int argc, char **argv)
 	}
 	if (options.count("size")) {
 		if (!options["size"].size()) {
+			options["size"] = options["pos1"];
+		}
+		if (!options["size"].size()) {
 			options["size"] = "skystream.json";
 			std::cerr << "No --size=, assuming " << options["size"] << std::endl;
 		}
@@ -117,6 +119,9 @@ int main(int argc, char **argv)
 	std::mutex groupmutex;
 	std::condition_variable reading;
 	if (options.count("down")) {
+		if (!options["down"].size()) {
+			options["down"] = options["pos1"];
+		}
 		if (!options["down"].size()) {
 			options["down"] = "skystream.json";
 			std::cerr << "No --down=, assuming " << options["down"] << std::endl;
@@ -136,7 +141,7 @@ int main(int argc, char **argv)
 			ssize_t size;
 			while ((size = stream.queue_net_down()) != -1) {
 				if (size) {
-					std::cerr << "Queued " << size << " bytes" << std::endl;
+					std::cerr << "Finished queuing " << size << " bytes" << std::endl;
 				}
 			}
 		});
@@ -157,6 +162,9 @@ int main(int argc, char **argv)
 		stream.shutdown();
 		pump.join();
 	} else if (options.count("up")) {
+		if (!options["up"].size()) {
+			options["up"] = options["pos1"];
+		}
 		if (!options["up"].size()) {
 			options["up"] = "skystream.json";
 			std::cerr << "No --up=, assuming " << options["up"] << std::endl;

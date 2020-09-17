@@ -9,7 +9,7 @@ run: simpleplot
 all: simpleplot
 
 clean:
-	-rm skystreamtest bufferedskystramtest simpleplot *.o
+	-rm skystreamtest bufferedskystreamtest simpleplot *.o
 
 runtest: skystreamtest bufferedskystreamtest
 	-rm tmp.json

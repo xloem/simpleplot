@@ -249,7 +249,7 @@ public:
 				offset = range.second;
 				range = block_span("bytes", offset);
 			}
-		} catch (std::out_of_range) { } // thrown at end of stream
+		} catch (std::out_of_range&) { } // thrown at end of stream
 				// note workers and calls to block_span
 				// are ordered so as to workaround not
 				// having implemented RAII for struct worker
@@ -494,7 +494,7 @@ void bufferedskystreams::pump_down()
 			std::unique_lock lock(down_priorities_mutex);
 			if (down_priorities.size() == 0) {
 				{
-					std::scoped_lock(streams_mutex);
+					std::scoped_lock lock(streams_mutex);
 					if (!pumping) {
 						return;
 					}
@@ -524,7 +524,7 @@ void bufferedskystreams::pump_up()
 			std::unique_lock lock(up_priorities_mutex);
 			if (up_priorities.size() == 0) {
 				{
-					std::scoped_lock(streams_mutex);
+					std::scoped_lock lock(streams_mutex);
 					if (!pumping) {
 						break;
 					}

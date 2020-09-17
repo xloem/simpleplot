@@ -1,5 +1,5 @@
-CPPFLAGS=-I/usr/local/include $$(pkg-config --cflags fuse3) $$(pkg-config --cflags openssl) -Isiaskynetpp/dependencies/json/include
-LDFLAGS=-L/usr/local/lib64 -ggdb
+CPPFLAGS=-I/usr/local/include $$(pkg-config --cflags fuse3) $$(pkg-config --cflags openssl) -Isiaskynetpp/dependencies/json/include -Isiaskynetpp/include
+LDFLAGS=-L/usr/local/lib64 -Lsiaskynetpp/build -Lsiaskynetpp/build/lib
 CXXFLAGS=-std=c++17 -ggdb -Wall -O0
 LDLIBS=-lsiaskynetpp -lcpr -lcurl $$(pkg-config --libs fuse3) $$(pkg-config --libs openssl) -LlibShabal/target/release -lshabal -Wl,-rpath,libShabal/target/release
 

@@ -11,7 +11,7 @@ nlohmann::json file2json(std::string filename)
 	ss << file.rdbuf();
 	try {
 		return nlohmann::json::parse(ss.str());
-	} catch (nlohmann::detail::parse_error) {
+	} catch (nlohmann::detail::parse_error&) {
 		return nlohmann::json{};
 	}
 }

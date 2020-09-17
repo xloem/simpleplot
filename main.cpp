@@ -54,7 +54,7 @@ class Plotfile
 {
 public:
 	Plotfile(uint64_t account, std::string filename)
-	: account(account), _identifiers(file2json(filename)), metastream(_identifiers, portalpool), scoops(portalpool), identifiersfile(filename)
+	: account(account), _identifiers(file2json(filename)), metastream(portalpool, _identifiers), scoops(portalpool), identifiersfile(filename)
 	{
 		if (_identifiers.empty()) {
 			std::cerr << "Readying scoop pumps ..." << std::endl;
@@ -66,7 +66,8 @@ public:
 			_identifiers = metastream.identifiers();
 			start();
 		} else {
-			auto data = metastream.read("index", metastream.span("index").second);
+			double tailindex = metastream.span("index").second;
+			auto data = metastream.read("index", tailindex);
 			std::string str(data.begin(), data.end());
 			metadata = nlohmann::json::parse(str);
 			std::cerr << "Found metadata document. " << std::endl;
@@ -128,11 +129,10 @@ public:
 		uint64_t scoopsindex = offset / scoopssize;
 		offset -= scoopsindex * scoopssize;
 		if (scoopsindex != lastscoopread) {
-			scoops.get(lastscoopread)->xfer_local_down(0,0,0);
+			scoops.get(lastscoopread).xfer_local_down(0,0,0);
 			lastscoopread = scoopsindex;
 		}
-		// this discards data.
-		auto data = scoops.get(scoopsindex)->xfer_local_down(offset, size);
+		auto data = scoops.get(scoopsindex).xfer_local_down(offset, size);
 		std::copy(data.begin(), data.end(), buf);
 		return data.size();
 	}
@@ -168,7 +168,7 @@ private:
 
 		scoopsthread = std::thread(&Plotfile::sendplot, this);
 		//metadatathread = std::thread(&Plotfile::scribeplot, this);
-		scoops.set_up_callback({scribeplot, this});
+		scoops.set_up_callback(std::bind(&Plotfile::scribeplot, this, std::placeholders::_1, std::placeholders::_2));
 		lastscoopread = 0;
 	}
 	void sendplot()
@@ -190,17 +190,12 @@ private:
 				std::vector<uint8_t> data;
 				data.resize(sizeof(nonce::scoop));
 				std::copy((char*)&scoop,(char*)(&scoop+1),data.data());
-				assert(scoops[index]->sizeup() == depthup * data.size());
+				assert(scoops.get(index).sizeup() == depthup * data.size());
 				// scoops bounds should all have the right index
-				scoops[index]->queue_local_up(std::move(data));
+				scoops.get(index).queue_local_up(std::move(data));
 			}
 			++ depthup;
 		}
-		// wait for all scoops to send
-		for (auto & scoop : scoops) {
-			scoop->shutdown();
-		}
-		incrementstoppedcount();
 	}
 	void scribeplot(bufferedskystream& lastscoop, uint64_t lastsize)
 	{
@@ -215,13 +210,13 @@ private:
 
 		nlohmann::json identifiers;
 		uint64_t uploaded, total;
-		lastscoop->basictipmetadata(identifiers, uploaded, total);
-		metadata["scoopstreams"][lastcoop->index] = identifiers;
+		lastscoop.basictipmetadata(identifiers, uploaded, total);
+		metadata["scoopstreams"][lastscoop.index] = identifiers;
 		uint64_t scoopdepth = uploaded / sizeof(nonce::scoop);
 		assert(scoopdepth > depth);
 		-- scoopsonlyatdepth;
 
-		std::cerr << "Extended scoop " << lastscoop->index << " to " << scoopdepth << " nonces: " << scoopsonlyatdepth << " scoops remain." << std::endl;
+		std::cerr << "Extended scoop " << lastscoop.index << " to " << scoopdepth << " nonces: " << scoopsonlyatdepth << " scoops remain." << std::endl;
 
 		assert(scoopsonlyatdepth >= 0);
 		if (scoopsonlyatdepth == 0) {
@@ -245,15 +240,15 @@ private:
 				this->depth = scoopdepth;
 				metadatastr = metadata.dump();
 			}
-			std::vector<uint8_t> metadatabytes(datastr.begin(), datastr.end());
+			std::vector<uint8_t> metadatabytes(metadatastr.begin(), metadatastr.end());
 			// later, maybe use portalpool with metastream
-			metastream.write(data, "bytes", metastream.span("bytes").second);
+			metastream.write(metadatabytes, "bytes", metastream.span("bytes").second);
 			{
 				std::lock_guard<std::mutex> guard(mutex);
 				_identifiers = metastream.identifiers();
 				json2file(_identifiers, identifiersfile);
 			}
-			std::cer << "New noncecount: " << depth << std::endl;
+			std::cerr << "New noncecount: " << depth << std::endl;
 		}
 
 		// this function used to wait on the uploaded cv of the minimum stream.  we didn't know and had two approaches to rewrite, and picked the callback one so that data would be stored immediately after upload; a decision-making metric used in other logging projects.  likely the metric can be merged with other approaches; we need the norm of preserving data, and timestamps are part of data.
@@ -295,7 +290,7 @@ private:
 	
 };
 
-#define FUSE_USE_VERSION 34
+//#define FUSE_USE_VERSION 34
 #include "Fusepp/Fuse.cpp"
 
 
@@ -333,7 +328,7 @@ public:
 	~PlotFS()
 	{
 		plotfile->shutdown();
-		updateconfig();
+		//updateconfig();
 		delete plotfile;
 	}
 	/*
@@ -386,7 +381,7 @@ public:
 		filler(buf, "..", NULL, 0, FUSE_FILL_DIR_PLUS);
 		std::string filename = plotfile->filename();
 		filler(buf, filename.c_str(), NULL, 0, FUSE_FILL_DIR_PLUS);
-		updateconfig();
+		//updateconfig();
 	
 		return 0;
 	}
@@ -400,7 +395,7 @@ public:
 		if (noncecount == -1) {
 			return -ENOENT;
 		}
-		updateconfig();
+		//updateconfig();
 	
 		return 0;
 	}

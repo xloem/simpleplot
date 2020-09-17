@@ -83,7 +83,7 @@ int main(int argc, char **argv)
 		uint64_t end = offset + length;
 		std::cerr << "Downloading range [" << offset << "," << end << ") from " << options["down"] << " to stdout ..." << std::endl;
 		std::mutex outputline;
-		streams.set_down_callback([&outputline](bufferedskystream&stream, size_t size){
+		streams.set_down_callback([&outputline](bufferedskystream&stream, uint64_t size){
 			std::scoped_lock lock(outputline);
 	                std::cerr << "Finished queuing download of " << size << " bytes" << std::endl;
 		});
@@ -123,7 +123,7 @@ int main(int argc, char **argv)
 		data.resize(data.capacity());
 		ssize_t size;
 		std::mutex outputline;
-		streams.set_up_callback([&outputline,&options](bufferedskystream&stream, size_t size){
+		streams.set_up_callback([&outputline,&options](bufferedskystream&stream, uint64_t size){
 			json2file(stream.identifiers(), options["up"]);
 			std::scoped_lock lock(outputline);
 			std::cerr << "Uploaded " << size << " bytes" << std::endl;

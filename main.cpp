@@ -7,6 +7,10 @@
 // of one netowrk could be used to make money on another.
 // There are many similar spaces.  This one is near.
 
+// In reality, network bandwidth is incomparable to harddrive bandwidth for almost everyone,
+// and a network miner like this wouldn't be able to meet the 4 minute block time to be competitive.
+// But it's great to have improved skystream.
+
 #define _FILE_OFFSET_BITS 64
 #include <cstdint>
 

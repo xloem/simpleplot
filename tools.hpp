@@ -21,6 +21,9 @@ void json2file(nlohmann::json json, std::string filename)
 	auto tmpfilename = filename + ".tmp";
 	std::istringstream ss(json.dump());
 	std::ofstream file(tmpfilename);
+	if (!file.is_open()) {
+		throw std::runtime_error("Couldn't open " + tmpfilename + ":" + strerror(errno));
+	}
 	file << ss.rdbuf();
 	file.close();
 

@@ -43,7 +43,7 @@ public:
 				{"content", {
 					{"spans",{
 						//{"real", {
-							{"time", {{"start", time()}, {"end", time()}}},
+							{"time", {{"start", now}, {"end", now}}},
 							{"index", {{"start", 0}, {"end", 0}}},
 							{"bytes", {{"start", 0}, {"end", 0}}}
 						//}}
@@ -69,7 +69,14 @@ public:
 		auto data = get(metadata_content["identifiers"], worker);
 	
 		auto begin = data.begin() + offset - content_start;
-		auto end = data.begin() + metadata_content["bounds"]["bytes"]["end"] - content_start;
+		// the goal here was, if the span is bytes, to use it as the offset in
+		// otherwise, to just return the whole chunk
+		auto end = begin;
+		if (span == "bytes") {
+			end += (uint64_t)metadata_content["bounds"]["bytes"]["end"] - content_start;
+		} else {
+			end = data.end();
+		}
 		offset = metadata_content["bounds"][span]["end"];
 		return {begin, end};
 	}
@@ -139,7 +146,7 @@ public:
 		}
 
 		nlohmann::json lookup_nodes = nlohmann::json::array();
-		size_t depth = 0;
+		//size_t depth = 0;
 		nlohmann::json new_lookup_node;
 		node preceding;
 		lookup_nodes.clear();

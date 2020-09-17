@@ -91,11 +91,15 @@ public:
 	bufferedskystream(bufferedskystreams & group, size_t index = 0, nlohmann::json identifiers = {})
 	: skystream(group.portalpool, identifiers),
 	  group(group),
-	  index(index)
+	  _index(index)
 	{
 		start();
 	}
-	size_t const index;
+
+	size_t index()
+	{
+		return _index;
+	}
 
 	bufferedskystream(bufferedskystream const &) = default;
 	bufferedskystream(bufferedskystream &&) = default;
@@ -124,29 +128,29 @@ public:
 	uint64_t sizeup()
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		return offsetup;
+		return tailup;
 	}
 	uint64_t backlogup()
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		return queueup.size();
+		return tailup - offsetup;
 	}
 	uint64_t processedup()
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		return offsetup - queueup.size();
+		return offsetup;
 	}
 	std::pair<uint64_t,uint64_t> processed_and_total()
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		return {offsetup - queueup.size(), offsetup};
+		return {offsetup, tailup};
 	}
 	void basictipmetadata(nlohmann::json & identifiers, uint64_t & uploaded, uint64_t & total)
 	{
 		std::lock_guard<std::mutex> lock(mutex);
 		identifiers = skystream::identifiers();
-		total = offsetup;
-		uploaded = total - queueup.size();
+		total = tailup;
+		uploaded = offsetup;
 	}
 
 	void queue_local_up(std::vector<uint8_t> && data)
@@ -154,29 +158,31 @@ public:
 		size_t uploaded = 0;
 		while (uploaded < data.size()) {
 			size_t toupload = data.size() - uploaded;
-			uint64_t newprio;
 			{
-				std::unique_lock<std::mutex> lock(mutex);
+				std::unique_lock lock(group.up_priorities_mutex);
 				if (group.maxblocksize > 0) {
-					while (pumping && queueup.size() >= group.maxblocksize*2) {
+					while (queueup.size() >= group.maxblocksize*2) {
 						this->uploaded.wait(lock);
 					}
 					if (queueup.size() + toupload > group.maxblocksize*2) {
 						toupload = group.maxblocksize*2 - queueup.size() ;
 					}
 				}
-				queueup.insert(queueup.end(), data.begin() + uploaded, data.begin() + uploaded + toupload);
-				newprio = queueup.size();
-			}
-			{
-				std::unique_lock lock(group.up_priorities_mutex);
-				for (auto range = group.up_priorities.equal_range(uppriority); range.first != range.second; ++range.first) {
-					if (range.first->second == this) {
-						group.up_priorities.erase(range.first);
-						break;
-					}
+				{
+					std::unique_lock lock(mutex);
+					tailup += toupload;
 				}
-				uppriority = newprio;
+				queueup.insert(queueup.end(), data.begin() + uploaded, data.begin() + uploaded + toupload);
+				if (queueup.size() != uppriority) {
+					for (auto range = group.up_priorities.equal_range(uppriority); range.first != range.second; ++range.first) {
+						if (range.first->second == this) {
+							group.up_priorities.erase(range.first);
+							break;
+						}
+					}
+					uppriority = queueup.size();
+				}
+				assert(uppriority);
 				auto spot = group.up_priorities.emplace(uppriority, this);
 				if (spot == group.up_priorities.begin()) {
 					lock.unlock();
@@ -343,22 +349,25 @@ public:
 		{
 			std::unique_lock<std::mutex> lock(mutex);
 			if (!pumping) {
-				if (queueup.size() == 0) {
+				if (offsetup == tailup) {
 					lock.unlock();
 					uploaded.notify_all();
 					return -1;
 				}
-			} else if (queueup.size() == 0) {
+			} else if (offsetup == tailup) {
 				return 0;
 			}
-			// pull data to transfer into local variable
+			offset = offsetup;
+		}
+		// pull data to transfer into local variable
+		{
+			std::unique_lock lock(group.up_priorities_mutex);
 			if (group.maxblocksize <= 0 || queueup.size() <= group.maxblocksize) {
 				data = std::move(queueup);
 			} else {
 				data.insert(data.begin(), queueup.begin(), queueup.begin() + group.maxblocksize);
 				queueup.erase(queueup.begin(), queueup.begin() + group.maxblocksize);
 			}
-			offset = offsetup;
 		}
 		if (data.size()) {
 			write(data, "bytes", offset);
@@ -367,6 +376,19 @@ public:
 				offsetup += data.size();
 			}
 			uploaded.notify_all();
+		}
+		{
+			std::unique_lock lock(group.up_priorities_mutex);
+			if (queueup.size() == 0) {
+				assert(uppriority != 0); // logic flow with queue_local_up.  i thought it could be good to have only nonzero priorities in the queue, ever.
+				for (auto range = group.up_priorities.equal_range(uppriority); range.first != range.second; ++range.first) {
+					if (range.first->second == this) {
+						group.up_priorities.erase(range.first);
+						break;
+					}
+				}
+				uppriority = 0;
+			}
 		}
 		return data.size();
 	}
@@ -418,17 +440,19 @@ private:
 	{
 		std::lock_guard<std::mutex> lock(mutex);
 		offsetup = span("bytes").second;
+		tailup = offsetup;
 		offsetdown = 0;
 		taildown = 0;
 		downpriority = 0;
 		uppriority = 0;
 	}
 	bufferedskystreams & group;
+	size_t const _index;
 	bool pumping = true;
 	std::map<size_t, std::unique_ptr<downloader>> queuedown;
 	std::vector<uint8_t> queueup;
 	size_t offsetdown, taildown;
-	size_t offsetup;
+	size_t offsetup, tailup;
 	uint64_t downpriority;
 	uint64_t uppriority;
 };
@@ -479,6 +503,7 @@ void bufferedskystreams::pump_down()
 				continue;
 			}
 			stream = down_priorities.begin()->second;
+			// TODO: erase this next line, and have queue_net_down do it like in pump_up
 			down_priorities.erase(down_priorities.begin());
 		}
 		ssize_t size = stream->queue_net_down();
@@ -492,7 +517,8 @@ void bufferedskystreams::pump_down()
 void bufferedskystreams::pump_up()
 {
 	bufferedskystream * stream;
-	
+	decltype(up_priorities)::iterator streamit;
+
 	while("pumping") {
 		{
 			std::unique_lock lock(up_priorities_mutex);
@@ -500,16 +526,16 @@ void bufferedskystreams::pump_up()
 				{
 					std::scoped_lock(streams_mutex);
 					if (!pumping) {
-						return;
+						break;
 					}
 				}
 				up_new.wait(lock);
 				continue;
 			}
-			stream = up_priorities.begin()->second;
-			up_priorities.erase(up_priorities.begin());
+			streamit = up_priorities.begin();
+			stream = streamit->second;
 		}
-		ssize_t size = stream->xfer_net_up();
+		ssize_t size = stream->xfer_net_up(); // empties itself from up_priorities
 		if (size > 0) {
 			if (up_callback) {
 				up_callback(*stream, size);

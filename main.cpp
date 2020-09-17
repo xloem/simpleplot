@@ -54,8 +54,9 @@ class Plotfile
 {
 public:
 	Plotfile(uint64_t account, std::string filename)
-	: account(account), _identifiers(file2json(filename)), metastream(portalpool, _identifiers), scoops(portalpool), identifiersfile(filename)
+	: account(account), _identifiers(file2json(filename)), metastream(portalpool, _identifiers), identifiersfile(filename), scoops(portalpool)
 	{
+		_stoppedcount = 0;
 		if (_identifiers.empty()) {
 			std::cerr << "Readying scoop pumps ..." << std::endl;
 			while (scoops.size() < NUMSCOOPS) {
@@ -64,16 +65,15 @@ public:
 				std::cerr << scoops.size() << "/" << NUMSCOOPS << "\r" << std::flush;
 			}
 			_identifiers = metastream.identifiers();
-			start();
 		} else {
-			double tailindex = metastream.span("index").second;
+			double tailindex = metastream.span("index").second - 1;
 			auto data = metastream.read("index", tailindex);
 			std::string str(data.begin(), data.end());
 			metadata = nlohmann::json::parse(str);
 			std::cerr << "Found metadata document. " << std::endl;
 			std::cerr << "Readying scoop pumps ..." << std::endl;
 			for (auto & identifiers : metadata["scoopstreams"]) {
-				size_t index = scoops.add(identifiers);
+				scoops.add(identifiers);
 				std::cerr << scoops.size() << "/" << NUMSCOOPS << "\r" << std::flush;
 			}
 		}
@@ -122,16 +122,32 @@ public:
 
 	size_t readscoops(uint8_t * buf, uint64_t noncecount, size_t offset, size_t size)
 	{
+		if (noncecount == 0) { return 0; }
 		constexpr uint64_t scoopcount = sizeof(nonce::scoops) / sizeof(nonce::scoop);
+
 		// noncecount shows total filesize
 		// scoop id is within offset
+		
+		// size of each scoop in the file
 		uint64_t scoopssize = noncecount * sizeof(nonce) / scoopcount;
-		uint64_t scoopsindex = offset / scoopssize;
+
+		// scoop that the read is requested within
+		int64_t scoopsindex = offset / scoopssize;
+
+		// adjust offset to be relative to scoop start
 		offset -= scoopsindex * scoopssize;
 		if (scoopsindex != lastscoopread) {
+			// terminate streaming for any other scoop
 			scoops.get(lastscoopread).xfer_local_down(0,0,0);
 			lastscoopread = scoopsindex;
 		}
+
+		// ensure our size doesn't overflow the scoop
+		if (offset + size > scoopssize) {
+			size = scoopssize - offset;
+		}
+
+		// download
 		auto data = scoops.get(scoopsindex).xfer_local_down(offset, size);
 		std::copy(data.begin(), data.end(), buf);
 		return data.size();
@@ -190,9 +206,19 @@ private:
 				std::vector<uint8_t> data;
 				data.resize(sizeof(nonce::scoop));
 				std::copy((char*)&scoop,(char*)(&scoop+1),data.data());
-				assert(scoops.get(index).sizeup() == depthup * data.size());
-				// scoops bounds should all have the right index
-				scoops.get(index).queue_local_up(std::move(data));
+				auto offset = depthup * sizeof(nonce::scoop);
+				// scoops bounds should all be right
+				if (scoops.get(index).sizeup() > offset) {
+					std::vector<uint8_t> compare = scoops.get(index).xfer_local_down(offset, sizeof(nonce::scoop), offset + sizeof(nonce::scoop));
+					if (compare != data) {
+						throw std::runtime_error("existing scoop bytes don't match calculation");
+					}
+				} else {
+					assert(scoops.get(index).sizeup() == offset);
+					// send data
+					scoops.get(index).queue_local_up(std::move(data));
+					assert(scoops.get(index).sizeup() == offset + sizeof(nonce::scoop));
+				}
 			}
 			++ depthup;
 		}
@@ -211,14 +237,30 @@ private:
 		nlohmann::json identifiers;
 		uint64_t uploaded, total;
 		lastscoop.basictipmetadata(identifiers, uploaded, total);
-		metadata["scoopstreams"][lastscoop.index] = identifiers;
-		uint64_t scoopdepth = uploaded / sizeof(nonce::scoop);
+		metadata["scoopstreams"][lastscoop.index()] = identifiers;
+		int64_t scoopdepth = uploaded / sizeof(nonce::scoop);
 		assert(scoopdepth > depth);
 		-- scoopsonlyatdepth;
 
-		std::cerr << "Extended scoop " << lastscoop.index << " to " << scoopdepth << " nonces: " << scoopsonlyatdepth << " scoops remain." << std::endl;
+		std::cerr << "Extended scoop " << lastscoop.index() << " to " << scoopdepth << " nonces" << std::endl;
+		std::cerr << scoopsonlyatdepth << " scoops remain to raise noncecount above " << depth << std::endl;
 
 		assert(scoopsonlyatdepth >= 0);
+
+		std::string metadatastr;
+		{
+			std::lock_guard<std::mutex> guard(mutex);
+			metadatastr = metadata.dump();
+		}
+		std::vector<uint8_t> metadatabytes(metadatastr.begin(), metadatastr.end());
+		// later, maybe use portalpool with metastream
+		metastream.write(metadatabytes, "bytes", metastream.span("bytes").second);
+		{
+			std::lock_guard<std::mutex> guard(mutex);
+			_identifiers = metastream.identifiers();
+			json2file(_identifiers, identifiersfile);
+		}
+
 		if (scoopsonlyatdepth == 0) {
 			scoopdepth = depth;
 			for (size_t index = 0; index < scoops.size(); ++ index) {
@@ -234,19 +276,9 @@ private:
 			assert(scoopdepth > depth);
 
 			std::cerr << "Updating plotfile to " << scoopdepth << " nonces.  " << scoopsonlyatdepth << " scoops must be extended next." << std::endl;
-			std::string metadatastr;
 			{
 				std::lock_guard<std::mutex> guard(mutex);
 				this->depth = scoopdepth;
-				metadatastr = metadata.dump();
-			}
-			std::vector<uint8_t> metadatabytes(metadatastr.begin(), metadatastr.end());
-			// later, maybe use portalpool with metastream
-			metastream.write(metadatabytes, "bytes", metastream.span("bytes").second);
-			{
-				std::lock_guard<std::mutex> guard(mutex);
-				_identifiers = metastream.identifiers();
-				json2file(_identifiers, identifiersfile);
 			}
 			std::cerr << "New noncecount: " << depth << std::endl;
 		}
@@ -323,6 +355,9 @@ public:
 			updateconfig();
 		}
 		*/
+		char * path = realpath(configfilename.c_str(), 0);
+		configfilename = path;
+		free(path);
 		plotfile = new Plotfile(account, configfilename);
 	}
 	~PlotFS()

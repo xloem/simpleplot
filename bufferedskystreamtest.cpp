@@ -117,8 +117,8 @@ int main(int argc, char **argv)
 		}
 		skystream stream(file2json(options["size"]), pool);
 		auto range = stream.span("bytes");
-		std::cout << range.first << std::endl;
-		std::cout << range.second << std::endl;
+		//std::cout << (uint64_t)range.first << std::endl;
+		std::cout << (uint64_t)range.second << std::endl;
 	}
 	bufferedskystreams streams(pool);
 	if (options.count("down")) {
@@ -147,7 +147,7 @@ int main(int argc, char **argv)
 	                std::cerr << "Finished queuing download of " << size << " bytes" << std::endl;
 		});
 		while (offset < end) {
-			auto data = stream.xfer_local_down(offset, end);
+			auto data = stream.xfer_local_down(offset, 0, end);
 			{
 				std::scoped_lock lock(outputline);
 				std::cerr << "Downloaded " << data.size() << " bytes" << std::endl;
@@ -176,7 +176,7 @@ int main(int argc, char **argv)
 		bufferedskystream & stream = streams.get(0);
 		auto range = stream.span("bytes");
 		double offset = range.second;
-		std::cerr << "Uploading to " << options["up"] << " from stdin starting from " << "bytes" << " " << offset << std::endl;
+		std::cerr << "Uploading to " << options["up"] << " from stdin starting from " << "bytes" << " " << (uint64_t)offset << std::endl;
 		std::vector<uint8_t> data;
 		data.reserve(1024*1024*16);
 		data.resize(data.capacity());

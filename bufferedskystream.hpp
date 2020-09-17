@@ -37,7 +37,7 @@ public:
 	}
 	void shutdown();
 
-	void add(nlohmann::json identifiers = {});
+	size_t add(nlohmann::json identifiers = {});
 
 	void set_down_callback(std::function<void(bufferedskystream&,uint64_t)> callback)
 	{
@@ -262,8 +262,14 @@ public:
 	}
 
 	std::mutex read_mutex;
-	std::vector<uint8_t> xfer_local_down(uint64_t offset, uint64_t eventualtail = 0)
+	std::vector<uint8_t> xfer_local_down(uint64_t offset, uint64_t size = 0, int64_t eventualtail = -1)
 	{
+		if (eventualtail == -1) {
+			eventualtail = span("bytes").second;
+		}
+		if (size == 0) {
+			size = eventualtail - offset;
+		}
 		std::lock_guard<std::mutex> read_lock(read_mutex);
 		{
 			std::unique_lock<std::mutex> lock(mutex);
@@ -309,11 +315,25 @@ public:
 			}
 			std::vector<uint8_t> result;
 			while (queuedown.count(offsetdown)) {
-				auto item = std::move(queuedown[offsetdown]);
+				auto & itemr = queuedown[offsetdown];
+				std::scoped_lock(itemr->mutex);
+				if (offset + size < offsetdown + itemr->data.size()) {
+					// request ends before block does
+					if (offsetdown < offset) {
+						result.insert(result.end(), itemr->data.begin() + offset - offsetdown, itemr->data.begin() + offset + size - offsetdown);
+					} else {
+						result.insert(result.end(), itemr->data.begin(), itemr->data.begin() + offset + size - offsetdown);
+					}
+					return result;
+				}
+				auto item = std::move(itemr);
 				queuedown.erase(offsetdown);
-				std::scoped_lock(item->mutex);
-				result.insert(result.end(), item->data.begin(), item->data.end());
-				//std::cerr << "Ferrying " << item->data.size() << " bytes" << std::endl;
+				auto itembegin = item->data.begin();
+				if (offset > offsetdown) {
+					itembegin += offset - offsetdown;
+				}
+				result.insert(result.end(), itembegin, item->data.end());
+				//std::cerr << "Ferrying " << (item->data.end() - itembegin) << " bytes" << std::endl;
 				offsetdown += item->data.size();
 			}
 			return result;
@@ -438,15 +458,16 @@ void bufferedskystreams::shutdown()
 	}
 }
 
-void bufferedskystreams::add(nlohmann::json identifiers)
+size_t bufferedskystreams::add(nlohmann::json identifiers)
 {
 	std::scoped_lock lock(streams_mutex);
-	if (!pumping) { return; }
 	if (identifiers.empty()) {
 		streams.emplace_back(new bufferedskystream(*this));
 	} else {
 		streams.emplace_back(new bufferedskystream(identifiers, *this));
 	}
+	if (!pumping) { streams.back()->shutdown(); }
+	return streams.size() - 1;
 }
 
 void bufferedskystreams::pump_down()

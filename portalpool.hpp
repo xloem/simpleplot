@@ -75,7 +75,7 @@ public:
 				break;
 			} catch(std::runtime_error const & e) {
 				workstop(worker, 0);
-				std::cerr << w->portal->options.url << ": " << e.what() << std::endl;
+				std::cerr << worker->portal->options.url << ": " << e.what() << std::endl;
 				if (fail) {
 					result = {};
 					break;
@@ -109,7 +109,7 @@ public:
 				break;
 			} catch(std::runtime_error const & e) {
 				workstop(worker, 0);
-				std::cerr << w->portal->options.url << ": " << e.what() << std::endl;
+				std::cerr << worker->portal->options.url << ": " << e.what() << std::endl;
 				if (fail) {
 					link = {};
 					break;

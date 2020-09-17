@@ -282,7 +282,7 @@ public:
 		std::mutex skylink_mutex;
 		std::string skylink;
 		auto ensure_upload = [&]() {
-			std::string link = portalpool.upload(metadata_identifiers["sha3_512"], {metadata_upload, content});
+			std::string link = portalpool.upload(metadata_identifiers["sha3_512"], {metadata_upload, content}, false, worker);
 			{
 				std::lock_guard<std::mutex> lock(skylink_mutex);
 				skylink = link;

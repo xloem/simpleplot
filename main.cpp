@@ -19,7 +19,7 @@ struct nonce
 	};
 	struct scoop scoops[4096];
 };
-constexpr size_t NUMSCOOPS = sizeof(nonce::scoops) / sizeof(nonce::scoop);
+constexpr unsigned NUMSCOOPS = sizeof(nonce::scoops) / sizeof(nonce::scoop);
 
 // each value is a 64-bit number, _not_ zero-prefixed
 // POC1 filename: AccountID_StartingNonce_NrOfNonces_Stagger [stagger is nonces per group]
@@ -47,33 +47,34 @@ void create_plot(uint64_t account_id,
 
 #include <cassert>
 
-#include "skystream.hpp"
+#include "bufferedskystream.hpp"
+#include "tools.hpp"
 
 class Plotfile
 {
 public:
-	Plotfile(uint64_t account)
-	: account(account), metastream(portalpool), scoops(portalpool)
+	Plotfile(uint64_t account, std::string filename)
+	: account(account), _identifiers(file2json(filename)), metastream(_identifiers, portalpool), scoops(portalpool), identifiersfile(filename)
 	{
-		std::cerr << "Readying scoop pumps ..." << std::endl;
-		while (scoops.size() < NUMSCOOPS) {
-			size_t index = scoops.add();
-			metadata["scoopstreams"][index] = scoops.get(index).identifiers();
-			std::cerr << scoops.size() << "/" << NUMSCOOPS << "\r" << std::flush;
-		}
-		start();
-	}
-	Plotfile(uint64_t account, nlohmann::json identifiers)
-	: account(account), metastream(identifiers, portalpool), scoops(portalpool), _identifiers(identifiers)
-	{
-		auto data = metastream.read("index", metastream.span("index").second);
-		std::string str(data.begin(), data.end());
-		metadata = nlohmann::json::parse(str);
-		std::cerr << "Found metadata document. " << std::endl;
-		std::cerr << "Readying scoop pumps ..." << std::endl;
-		for (auto & identifiers : metadata["scoopstreams"]) {
-			size_t index = scoops.add(identifiers);
-			std::cerr << scoops.size() << "/" << NUMSCOOPS << "\r" << std::flush;
+		if (_identifiers.empty()) {
+			std::cerr << "Readying scoop pumps ..." << std::endl;
+			while (scoops.size() < NUMSCOOPS) {
+				size_t index = scoops.add();
+				metadata["scoopstreams"][index] = scoops.get(index).identifiers();
+				std::cerr << scoops.size() << "/" << NUMSCOOPS << "\r" << std::flush;
+			}
+			_identifiers = metastream.identifiers();
+			start();
+		} else {
+			auto data = metastream.read("index", metastream.span("index").second);
+			std::string str(data.begin(), data.end());
+			metadata = nlohmann::json::parse(str);
+			std::cerr << "Found metadata document. " << std::endl;
+			std::cerr << "Readying scoop pumps ..." << std::endl;
+			for (auto & identifiers : metadata["scoopstreams"]) {
+				size_t index = scoops.add(identifiers);
+				std::cerr << scoops.size() << "/" << NUMSCOOPS << "\r" << std::flush;
+			}
 		}
 		start();
 	}
@@ -131,10 +132,7 @@ public:
 			lastscoopread = scoopsindex;
 		}
 		// this discards data.
-		auto data = scoops.get(scoopsindex)->xfer_local_down(offset);
-		if (data.size() > size) {
-			data.resize(size);
-		}
+		auto data = scoops.get(scoopsindex)->xfer_local_down(offset, size);
 		std::copy(data.begin(), data.end(), buf);
 		return data.size();
 	}
@@ -143,8 +141,9 @@ public:
 	{
 		if (stoppedcount() == 0) {
 			incrementstoppedcount();
+			scoops.shutdown();
 			scoopsthread.join();
-			metadatathread.join();
+			//metadatathread.join();
 		}
 	}
 
@@ -153,8 +152,23 @@ public:
 private:
 	void start()
 	{
+		// first discern our depth
+		depth = -1;
+		for (size_t index = 0; index < scoops.size(); ++ index) {
+			auto & scoop = scoops.get(index);
+			int64_t thisdepth = scoop.processedup() / sizeof(nonce::scoop);
+			if (depth == -1 || thisdepth < depth) {
+				depth = thisdepth;
+				scoopsonlyatdepth = 1;
+			} else if (thisdepth == depth) {
+				++ scoopsonlyatdepth;
+			}
+		}
+		std::cerr << "Starting noncecount is " << depth << std::endl;
+
 		scoopsthread = std::thread(&Plotfile::sendplot, this);
-		metadatathread = std::thread(&Plotfile::scribeplot, this);
+		//metadatathread = std::thread(&Plotfile::scribeplot, this);
+		scoops.set_up_callback({scribeplot, this});
 		lastscoopread = 0;
 	}
 	void sendplot()
@@ -176,9 +190,9 @@ private:
 				std::vector<uint8_t> data;
 				data.resize(sizeof(nonce::scoop));
 				std::copy((char*)&scoop,(char*)(&scoop+1),data.data());
-				assert(scoops[index]->size() == depthup * data.size());
+				assert(scoops[index]->sizeup() == depthup * data.size());
 				// scoops bounds should all have the right index
-				scoops[index]->append(std::move(data));
+				scoops[index]->queue_local_up(std::move(data));
 			}
 			++ depthup;
 		}
@@ -188,43 +202,61 @@ private:
 		}
 		incrementstoppedcount();
 	}
-	void scribeplot()
+	void scribeplot(bufferedskystream& lastscoop, uint64_t lastsize)
 	{
-		std::cerr << "Beginning plot consolidation thread ..." << std::endl;
-		int64_t lastminimum = depth;
-		while (stoppedcount() < 2) {
-			int64_t minimum = -1;
-			size_t minimumindex;
+		// REVIWING FOR BUFFEREDSKYSTREAMS
+		// this looks like the first thing in need of modification
+		// i'm suspecting it sohuld turn into an upload callback.
+
+		// rewrote this to function as a callback but believe there was a logical error
+		// oh no i think it works!  it's just kinda obscure.  scoops sets up a pump that pumps the stream most in need.
+		// we keep them all the same, so the shortest ones are pumped.  it unfortunately relise on internal behavior.
+		// but it has the advantage right now of testing that behavior.
+
+		nlohmann::json identifiers;
+		uint64_t uploaded, total;
+		lastscoop->basictipmetadata(identifiers, uploaded, total);
+		metadata["scoopstreams"][lastcoop->index] = identifiers;
+		uint64_t scoopdepth = uploaded / sizeof(nonce::scoop);
+		assert(scoopdepth > depth);
+		-- scoopsonlyatdepth;
+
+		std::cerr << "Extended scoop " << lastscoop->index << " to " << scoopdepth << " nonces: " << scoopsonlyatdepth << " scoops remain." << std::endl;
+
+		assert(scoopsonlyatdepth >= 0);
+		if (scoopsonlyatdepth == 0) {
+			scoopdepth = depth;
 			for (size_t index = 0; index < scoops.size(); ++ index) {
-				nlohmann::json identifiers;
-				uint64_t uploaded, total;
-				scoops[index]->basictipmetadata(identifiers, uploaded, total);
-				metadata["scoopstreams"][index] = identifiers;
-				if (uploaded < minimum || minimum == -1) {
-					minimum = uploaded;
-					minimumindex = index;
+				auto & scoop = scoops.get(index);
+				int64_t thisdepth = scoop.processedup() / sizeof(nonce::scoop);
+				if (scoopdepth == depth || thisdepth < scoopdepth) {
+					scoopdepth = thisdepth;
+					scoopsonlyatdepth = 1;
+				} else if (scoopdepth == thisdepth) {
+					++ scoopsonlyatdepth;
 				}
 			}
-			if (minimum > lastminimum) {
-				std::cerr << "Stored new noncecount of " << minimum << "." << std::endl;
-				lastminimum = minimum;
-				std::vector<uint8_t> data;
-				{
-					std::lock_guard<std::mutex> guard(mutex);
-					depth = minimum;
-					std::string datastr = metadata.dump();
-					data.insert(data.end(), datastr.begin(), datastr.end());
-				}
-				metastream.write(data, "bytes", metastream.span("bytes").second);
-				{
-					std::lock_guard<std::mutex> guard(mutex);
-					_identifiers = metastream.identifiers();
-				}
-			} else {
-				std::unique_lock<std::mutex> lock(scoops[minimumindex]->mutex);
-				scoops[minimumindex]->uploaded.wait(lock);
+			assert(scoopdepth > depth);
+
+			std::cerr << "Updating plotfile to " << scoopdepth << " nonces.  " << scoopsonlyatdepth << " scoops must be extended next." << std::endl;
+			std::string metadatastr;
+			{
+				std::lock_guard<std::mutex> guard(mutex);
+				this->depth = scoopdepth;
+				metadatastr = metadata.dump();
 			}
+			std::vector<uint8_t> metadatabytes(datastr.begin(), datastr.end());
+			// later, maybe use portalpool with metastream
+			metastream.write(data, "bytes", metastream.span("bytes").second);
+			{
+				std::lock_guard<std::mutex> guard(mutex);
+				_identifiers = metastream.identifiers();
+				json2file(_identifiers, identifiersfile);
+			}
+			std::cer << "New noncecount: " << depth << std::endl;
 		}
+
+		// this function used to wait on the uploaded cv of the minimum stream.  we didn't know and had two approaches to rewrite, and picked the callback one so that data would be stored immediately after upload; a decision-making metric used in other logging projects.  likely the metric can be merged with other approaches; we need the norm of preserving data, and timestamps are part of data.
 	}
 	// skystream:
 	// .get(json identifiers) // returns a std::vector<uint8_t> for identifires["skylink"]
@@ -236,8 +268,10 @@ private:
 	// spans are "bytes", "time", "index"
 	// so we could write to nonces or scoops
 	sia::portalpool portalpool;
+	nlohmann::json _identifiers;
 	skystream metastream;
 	nlohmann::json metadata;
+	std::string identifiersfile;
 	bufferedskystreams scoops;
 
 	std::thread metadatathread;
@@ -246,8 +280,8 @@ private:
 
 	std::mutex mutex;
 	int _stoppedcount;
-	uint64_t depth;
-	nlohmann::json _identifiers;
+	int64_t depth;
+	uint64_t scoopsonlyatdepth;
 	int stoppedcount()
 	{
 		std::lock_guard<std::mutex> guard(mutex);
@@ -277,6 +311,7 @@ public:
 		PlotFS::configfilename = configfilename;
 		uint64_t account = std::stoull(configfilename);
 		std::cerr << "Opening config file " << configfilename << " ..." << std::endl;
+		/*
 		std::ifstream configfile(configfilename);
 		if (configfile.is_open()) {
 			std::ostringstream configstrm;
@@ -292,6 +327,8 @@ public:
 			plotfile = new Plotfile(account);
 			updateconfig();
 		}
+		*/
+		plotfile = new Plotfile(account, configfilename);
 	}
 	~PlotFS()
 	{
@@ -299,6 +336,7 @@ public:
 		updateconfig();
 		delete plotfile;
 	}
+	/*
 	static void updateconfig()
 	{
 		auto noncecount = plotfile->noncecount();
@@ -317,6 +355,7 @@ public:
 			throw std::runtime_error(strerror(result));
 		}
 	}
+	*/
 	static int getattr(const char *path, struct stat *stbuf, struct fuse_file_info *)
 	{
 		memset(stbuf, 0, sizeof(struct stat));

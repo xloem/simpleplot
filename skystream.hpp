@@ -23,24 +23,7 @@ seconds_t time()
 class skystream
 {
 public:
-	skystream(sia::portalpool & portalpool)
-	: portalpool(portalpool)
-	{
-		auto now = time();
-		tail.metadata = {
-			{"content", {
-				{"spans",{
-					//{"real", {
-						{"time", {{"start", time()}, {"end", time()}}},
-						{"index", {{"start", 0}, {"end", 0}}},
-						{"bytes", {{"start", 0}, {"end", 0}}}
-					//}}
-				}}
-			}}//,
-			//{"flows", {}}
-		};
-	}
-	skystream(std::string way, std::string link, sia::portalpool & portalpool)
+	skystream(sia::portalpool & portalpool, std::string way, std::string link)
 	: portalpool(portalpool)
 	{
 		std::vector<uint8_t> data;
@@ -48,9 +31,28 @@ public:
 		tail.identifiers = cryptography.digests({&data});
 		tail.identifiers[way] = link;
 	}
-	skystream(nlohmann::json identifiers, sia::portalpool & portalpool)
-	: tail{identifiers, get_json(identifiers)}, portalpool(portalpool)
-	{ }
+	skystream(sia::portalpool & portalpool, nlohmann::json identifiers = {})
+	: portalpool(portalpool)
+	{
+		tail.identifiers = identifiers;
+		if (!identifiers.empty()) {
+			tail.metadata = get_json(identifiers);
+		} else {
+			auto now = time();
+			tail.metadata = {
+				{"content", {
+					{"spans",{
+						//{"real", {
+							{"time", {{"start", time()}, {"end", time()}}},
+							{"index", {{"start", 0}, {"end", 0}}},
+							{"bytes", {{"start", 0}, {"end", 0}}}
+						//}}
+					}}
+				}}//,
+				//{"flows", {}}
+			};
+		}
+	}
 
 	skystream(skystream const &) = default;
 	skystream(skystream &&) = default;

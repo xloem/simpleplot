@@ -88,19 +88,14 @@ private:
 class bufferedskystream : public skystream
 {
 public:
-	using skystream::skystream;
-	bufferedskystream(bufferedskystreams & group)
-	: skystream(group.portalpool),
-	  group(group)
+	bufferedskystream(bufferedskystreams & group, size_t index = 0, nlohmann::json identifiers = {})
+	: skystream(group.portalpool, identifiers),
+	  group(group),
+	  index(index)
 	{
 		start();
 	}
-	bufferedskystream(nlohmann::json identifiers, bufferedskystreams & group)
-	: skystream(identifiers, group.portalpool),
-	  group(group)
-	{
-		start();
-	}
+	size_t const index;
 
 	bufferedskystream(bufferedskystream const &) = default;
 	bufferedskystream(bufferedskystream &&) = default;
@@ -461,11 +456,7 @@ void bufferedskystreams::shutdown()
 size_t bufferedskystreams::add(nlohmann::json identifiers)
 {
 	std::scoped_lock lock(streams_mutex);
-	if (identifiers.empty()) {
-		streams.emplace_back(new bufferedskystream(*this));
-	} else {
-		streams.emplace_back(new bufferedskystream(identifiers, *this));
-	}
+	streams.emplace_back(new bufferedskystream(*this, streams.size(), identifiers));
 	if (!pumping) { streams.back()->shutdown(); }
 	return streams.size() - 1;
 }
